@@ -12,18 +12,22 @@ import SimpleITK as sitk
 import numpy as np
 from scipy import sparse
 import array_api_compat
-
+import cupy as cp
+import math
 from pyRadPlan.core import resample_image, np2sitk
 from pyRadPlan.ct import CT, default_hlut
 from pyRadPlan.cst import StructureSet
 from pyRadPlan.stf import SteeringInformation
 from pyRadPlan.geometry import get_beam_rotation_matrix
 from pyRadPlan.raytracer import RayTracerSiddon
+from numba import njit,cuda
 
 from ._base import DoseEngineBase
 from ...core.xp_utils.typing import Array
 
-
+gpu=0
+filling_gpu=0
+move=0
 logger = logging.getLogger(__name__)
 
 
@@ -145,7 +149,16 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         dict
             The dose influence matrix dictionary.
         """
-
+        timing = {
+        "_compute_bixel": 0,
+        "_fill_dij": 0,
+        "move":0,
+        "geo_dist_gpu":0,
+        "geo_dist":0,
+        "filling_gpu":0,
+        "init_beam":0,
+        "to_gpu":0
+        }
         # Initialize
         dij = self._init_dose_calc(ct, cst, stf)
 
@@ -173,18 +186,32 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                 for i in tqdm(range(dij["num_of_beams"]), desc="Beam", unit="b", leave=False):
                     # Initialize Beam Geometry
                     t = time.time()
+                    start=time.perf_counter()
                     curr_beam = self._init_beam(dij, ct, cst, scen_stf, i)
+                    timing["init_beam"]+=time.perf_counter()-start
+
                     logger.info("Beam %d initialized in %f seconds.", i + 1, time.time() - t)
 
                     # Keep tabs on bixels computed in this beam
                     bixel_beam_counter = 0
+                    m=curr_beam["bev_coords"][curr_beam["valid_coords_all"], :].shape[0]      
+                    s=time.perf_counter()
+                    bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :])
+                    source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) 
+                        
+                    rot_coords_temp=cp.empty((m,3),dtype=cp.float32)
+                    target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])])
+                    target_point_bev=cp.asarray(target_point_bev)
+                    timing["move"]=time.perf_counter()-s
 
                     # Ray calculation
                     for j in tqdm(
                         range(curr_beam["beam"]["num_of_rays"]), desc="Ray", unit="r", leave=False
                     ):
                         # Initialize Ray Geometry
-                        curr_ray = self._init_ray(curr_beam, j)
+                        #curr_ray = self._init_ray(curr_beam, j)
+                        curr_ray = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev)
+
 
                         # Even if the ray hits nothing, we still emit empty bixel columns
                         # so that CSC structures and bookkeeping stay consistent.
@@ -228,6 +255,10 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         # Progress Update & Bookkeeping
                         bixel_counter += curr_ray["num_of_bixels"]
                         bixel_beam_counter += curr_ray["num_of_bixels"]
+                        
+        timing["geo_dist_gpu"] += gpu
+        timing["filling_gpu"] += filling_gpu
+
 
         # Finalize dose calculation
         logger.info("Finalizing dose calculation...")
@@ -235,6 +266,10 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         dij = self._finalize_dose(dij)
         t_end = time.time()
         logger.info("Done in %f seconds.", t_end - t_start)
+
+        for func, t in timing.items():
+         logger.info(f"Total time in {func}: {t:.6f} seconds")
+
 
         return dij
 
@@ -477,6 +512,174 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         ray["bixel_width"] = beam_info["beam"]["bixel_width"]
 
         self._get_ray_geometry_from_beam(ray, beam_info)
+
+        return ray
+    def _init_ray_gpu(self, beam_info: dict[str], j: int,bev_coords,source_point_bev,rot_coords_temp,target_point_bev) -> dict[str]:
+        """
+        Initialize a ray for pencil beam dose calculation.
+
+        Parameters
+        ----------
+        curr_beam : dict
+            The current beam data.
+        j : int
+            The ray index.
+
+        Returns
+        -------
+        dict
+            The initialized ray.
+        """
+        global gpu,move,filling_gpu
+
+
+
+        ray = beam_info["beam"]["rays"][j]
+        ray["beam_index"] = beam_info["beam_index"]
+        ray["ray_index"] = j
+        ray["iso_center"] = beam_info["beam"]["iso_center"]
+
+        if "num_of_bixels_per_ray" in beam_info["beam"]:
+            ray["num_of_bixels"] = beam_info["beam"]["num_of_bixels_per_ray"][j]
+        else:
+            # Fallback: use the actual number of beamlets on this ray
+            # This is needed for machines like "Focused" that don't precompute counts.
+            ray["num_of_bixels"] = len(ray.get("beamlets", [])) or 0
+
+        ray["source_point_bev"] = beam_info["beam"]["source_point_bev"]
+        ray["sad"] = beam_info["beam"]["sad"]
+        ray["bixel_width"] = beam_info["beam"]["bixel_width"]
+
+        ray["effective_lateral_cut_off"] = beam_info.get(
+            "effective_lateral_cut_off", self._effective_lateral_cutoff
+        )
+        nb_rays=beam_info["beam"]["num_of_rays"]
+        rad_depth_ix= beam_info["valid_coords_all"]
+        m=beam_info["bev_coords"][rad_depth_ix, :].shape[0]       
+        threads_per_block = 512
+        blocks_per_grid = (m+threads_per_block-1)//threads_per_block
+        radial_dist_sq_device=cp.empty((m),dtype=cp.float32)
+        lat_dists_device=cp.empty((m,2),dtype=cp.float32)
+        subset_mask_device=cp.empty((m),dtype=cp.int32)
+        """
+        a0 = -ray["source_point_bev"][0]
+        a1 = -ray["source_point_bev"][1]
+        a2 = -ray["source_point_bev"][2]
+
+        norm_a = math.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+
+        a0 /= norm_a
+        a1 /= norm_a
+        a2 /= norm_a
+
+
+        bx = ray["target_point_bev"][0] - ray["source_point_bev"][0]
+        by = ray["target_point_bev"][1] - ray["source_point_bev"][1]
+        bz = ray["target_point_bev"][2] - ray["source_point_bev"][2]
+
+        norm_b = math.sqrt(bx*bx + by*by + bz*bz)
+        bx /= norm_b
+        by /= norm_b
+        bz /= norm_b
+
+        cx = a1 * bz - a2 * by
+        cy = a2 * bx - a0 * bz
+        cz = a0 * by - a1 * bx
+        cnorm=math.sqrt(cx * cx + cy * cy + cz * cz)
+        tolerance = 1e-7
+        """
+        #start_event = cuda.event()
+
+        #end_event = cuda.event()
+        #cp.cuda.Device(0).use()
+        #cuda.select_device(0)
+        """
+        if abs(a0 - bx) < tolerance and abs(a1 - by) < tolerance and abs(a2 - bz) < tolerance:
+         cuda.synchronize()
+         start_event.record()
+         self.calc_geo_dists_gpu1[blocks_per_grid, threads_per_block](
+         bev_coords,
+         source_point_bev,
+                        ray["sad"],
+                        self._get_lateral_distance_from_dose_cutoff_on_ray(ray),
+                        m,
+                        rot_coords_temp,
+                        subset_mask_device,
+                        radial_dist_sq_device,
+                        lat_dists_device
+                        )
+         end_event.record()
+         end_event.synchronize()
+         gpu +=cuda.event_elapsed_time(start_event, end_event)
+        else:
+        """
+        timing_buffer = cp.zeros((m, 2), dtype=cp.int64)
+        cuda.synchronize()
+        start=time.perf_counter()
+        self.calc_geo_dists_gpu[blocks_per_grid, threads_per_block](
+         bev_coords,
+         source_point_bev,
+         target_point_bev[j],
+                        ray["sad"],
+                        self._get_lateral_distance_from_dose_cutoff_on_ray(ray),
+                        nb_rays,
+                        m,
+                        rot_coords_temp,
+                        subset_mask_device,
+                        radial_dist_sq_device,
+                        lat_dists_device,timing_buffer
+                        )
+        #end_event.record()
+        #end_event.synchronize()
+        gpu +=time.perf_counter()-start
+        #timing = timing_buffer.copy_to_host()
+        #print("Mean A:", timing[:, 0].mean(), "cycles")
+
+        subset_mask_device=subset_mask_device.astype(cp.bool_)
+        #start=time.perf_counter()
+        
+        subset_mask_device=subset_mask_device.get()
+        radial_dist_sq_device=radial_dist_sq_device.get()
+        lat_dists_device=lat_dists_device.get()
+        #move=time.perf_counter()-start
+
+        ix=rad_depth_ix.copy()
+        rad_distances_sq_tmp = radial_dist_sq_device[subset_mask_device]
+
+        lat_dists_tmp = lat_dists_device[subset_mask_device, :]
+        ix[rad_depth_ix]=subset_mask_device
+                       
+
+
+        s=time.perf_counter()
+        ray["valid_coords"] = [beam_ix & ix for beam_ix in beam_info["valid_coords"]]
+        ray["ix"] = [self._vdose_grid[ix_in_grid] for ix_in_grid in ray["valid_coords"]]
+
+        ray["radial_dist_sq"] = [rad_distances_sq_tmp[beam_ix[ix]] for beam_ix in ray["valid_coords"]]
+
+        ray["lat_dists"] = [lat_dists_tmp[beam_ix[ix]] for beam_ix in ray["valid_coords"]]
+
+        ray["valid_coords_all"] = np.any(np.vstack(ray["valid_coords"]), axis=1)
+
+        ray["geo_depths"] = [
+                        rD[ix] for rD, ix in zip(beam_info["geo_depths"], ray["valid_coords"])
+                        ]  
+        ray["rad_depths"] = [
+                        rD[ix] for rD, ix in zip(beam_info["rad_depths"], ray["valid_coords"])
+                        ]
+                    
+        ray["sigma_ini"] = self._calc_sigma_ini_on_ray(ray)
+        if self.air_offset_correction:
+           nozzle_to_skin = (ray["SSD"] + self._machine.bams_to_iso_dist) - self._machine.sad
+           ray["rad_depth_offset"] = 0.0011 * (nozzle_to_skin - self._machine.fit_air_offset)
+        else:
+           ray["rad_depth_offset"] = 0
+        global filling_gpu
+        filling_gpu +=time.perf_counter()-s
+       
+
+        
+
 
         return ray
 
@@ -833,6 +1036,122 @@ class PencilBeamEngineAbstract(DoseEngineBase):
 
         # Call the finalizeDose method from the base class
         return super()._finalize_dose(dij)
+
+
+    @staticmethod
+    @cuda.jit
+    def calc_geo_dists_gpu(
+        rot_coords_bev, source_point_bev, target_point_bev, sad, lateral_cutoff,nb_rays,m,rot_coords_temp,subset_mask, rad_distances_sq, lat_dists,timing_buffer
+    ):
+        i = cuda.grid(1)
+        if i >= m: #nb operation
+           return
+        a0 = -source_point_bev[0]
+        a1 = -source_point_bev[1]
+        a2 = -source_point_bev[2]
+
+        norm_a = math.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+
+        a0 /= norm_a
+        a1 /= norm_a
+        a2 /= norm_a
+
+
+        bx = target_point_bev[0] - source_point_bev[0]
+        by = target_point_bev[1] - source_point_bev[1]
+        bz = target_point_bev[2] - source_point_bev[2]
+
+        norm_b = math.sqrt(bx*bx + by*by + bz*bz)
+        bx /= norm_b
+        by /= norm_b
+        bz /= norm_b
+
+        cx = a1 * bz - a2 * by
+        cy = a2 * bx - a0 * bz
+        cz = a0 * by - a1 * bx
+        cnorm=math.sqrt(cx * cx + cy * cy + cz * cz)
+        tolerance = 1e-7
+        if abs(a0 - bx) < tolerance and abs(a1 - by) < tolerance and abs(a2 - bz) < tolerance:
+
+                      
+                      
+            
+         rot_coords_temp[i,0]=rot_coords_bev[i][0]
+         rot_coords_temp[i,1]=rot_coords_bev[i][1]
+         rot_coords_temp[i,2]=rot_coords_bev[i][2]
+        else:
+           
+
+         cross=cuda.local.array((3,3), dtype=np.float32)
+         ################################################## skew matrix cross product building
+         cross[0, 0] = 0.0
+         cross[0, 1] = -cz
+         cross[0, 2] = cy
+
+         cross[1, 0] = cz
+         cross[1, 1] = 0.0
+         cross[1, 2] = -cx
+
+         cross[2, 0] = -cy
+         cross[2, 1] = cx
+         cross[2, 2] = 0.0
+         ##################################################
+         cross2=cuda.local.array((3,3), dtype=np.float32)
+         ##################################################
+         cross2[0, 0] = cross[0, 0] * cross[0, 0]+cross[0, 1] * cross[1, 0]+cross[0, 2] * cross[2, 0]
+         cross2[0, 1] = cross[0, 0] * cross[0, 1]+cross[0, 1] * cross[1, 1]+cross[0, 2] * cross[2, 1]
+         cross2[0, 2] = cross[0, 0] * cross[0, 2]+cross[0, 1] * cross[1, 2]+cross[0, 2] * cross[2, 2]
+
+         cross2[1, 0] = cross[1, 0] * cross[0, 0]+cross[1, 1] * cross[1, 0]+cross[1, 2] * cross[2, 0]
+         cross2[1, 1] = cross[1, 0] * cross[0, 1]+cross[1, 1] * cross[1, 1]+cross[1, 2] * cross[2, 1]
+         cross2[1, 2] = cross[1, 0] * cross[0, 2]+cross[1, 1] * cross[1, 2]+cross[1, 2] * cross[2, 2]
+
+
+         cross2[2, 0] = cross[2, 0] * cross[0, 0]+cross[2, 1] * cross[1, 0]+cross[2, 2] * cross[2, 0]
+         cross2[2, 1] = cross[2, 0] * cross[0, 1]+cross[2, 1] * cross[1, 1]+cross[2, 2] * cross[2, 1]
+         cross2[2, 2] = cross[2, 0] * cross[0, 2]+cross[2, 1] * cross[1, 2]+cross[2, 2] * cross[2, 2]
+         #################################################
+         offset=1-(a0*bx+a1*by+a2*bz)
+         derived_rot_mat=cuda.local.array((3,3),dtype=np.float32)
+         cnorm*=cnorm
+         ##################################################
+         derived_rot_mat[0, 0] = 1.0 + cross[0, 0] + (cross2[0, 0] *offset/(cnorm))
+         derived_rot_mat[0, 1] =  cross[0, 1] + (cross2[0, 1] * offset/(cnorm))
+         derived_rot_mat[0, 2] =  cross[0, 2] + (cross2[0, 2] * offset/(cnorm))
+
+         derived_rot_mat[1, 0] =  cross[1, 0] + (cross2[1, 0] * offset/(cnorm))
+         derived_rot_mat[1, 1] = 1.0 + cross[1, 1] + (cross2[1, 1] * offset/(cnorm))
+         derived_rot_mat[1, 2] =  cross[1, 2] + (cross2[1, 2] * offset/(cnorm))
+
+         derived_rot_mat[2, 0] =  cross[2, 0] + (cross2[2, 0] * offset/(cnorm))
+         derived_rot_mat[2, 1] =  cross[2, 1] + (cross2[2, 1] * offset/(cnorm))
+         derived_rot_mat[2, 2] =  1.0 + cross[2, 2] + (cross2[2, 2] * offset/(cnorm))
+         ##################################################
+        #add(identity,cross,cross2,off,cnorm*cnorm,derived_rot_mat)
+           
+         
+         for j in range(3):
+          val = 0
+          for k in range(3):
+            val += rot_coords_bev[i, k] * derived_rot_mat[k, j]
+          rot_coords_temp[i, j] = val
+         
+         """
+         rot_coords_temp[i, 0] = rot_coords_bev[i, 0] * derived_rot_mat[0, 0]+rot_coords_bev[i, 1] * derived_rot_mat[1, 0]+rot_coords_bev[i, 2] * derived_rot_mat[2, 0]
+         rot_coords_temp[i, 1] = rot_coords_bev[i, 0] * derived_rot_mat[0, 1]+rot_coords_bev[i, 1] * derived_rot_mat[1, 1]+rot_coords_bev[i, 2] * derived_rot_mat[2, 1]
+         rot_coords_temp[i, 2] = rot_coords_bev[i, 0] * derived_rot_mat[0, 2]+rot_coords_bev[i, 1] * derived_rot_mat[1,2 ]+rot_coords_bev[i, 2] * derived_rot_mat[2, 2]
+         """
+
+
+
+
+        lat_dists[i,0]=rot_coords_temp[i,0]+source_point_bev[0]
+        lat_dists[i,1]=rot_coords_temp[i,2]+source_point_bev[2]
+
+
+        rad_distances_sq[i]=lat_dists[i,0]**2+lat_dists[i,1]**2
+
+        subset_mask[i]=rad_distances_sq[i]<=(lateral_cutoff/sad)**2*rot_coords_temp[i,1]**2
 
     def calc_geo_dists(
         self,
