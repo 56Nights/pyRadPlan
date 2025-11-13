@@ -12,7 +12,7 @@ import SimpleITK as sitk
 import numpy as np
 from scipy import sparse
 import array_api_compat
-import cupy as cp
+#import cupy as cp
 import math
 from pyRadPlan.core import resample_image, np2sitk
 from pyRadPlan.ct import CT, default_hlut
@@ -25,10 +25,18 @@ from numba import njit,cuda
 from ._base import DoseEngineBase
 from ...core.xp_utils.typing import Array
 
+has_gpu=False
 gpu=0
 filling_gpu=0
 move=0
+geo_dist=0
 logger = logging.getLogger(__name__)
+
+if has_gpu:
+    import cupy as cp
+    #from numba import njit,cuda
+
+
 
 
 class PencilBeamEngineAbstract(DoseEngineBase):
@@ -195,22 +203,27 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                     # Keep tabs on bixels computed in this beam
                     bixel_beam_counter = 0
                     m=curr_beam["bev_coords"][curr_beam["valid_coords_all"], :].shape[0]      
-                    s=time.perf_counter()
-                    bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :])
-                    source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) 
+                    if has_gpu:
+                     s=time.perf_counter()
+                     bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :])
+                     source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) 
                         
-                    rot_coords_temp=cp.empty((m,3),dtype=cp.float32)
-                    target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])])
-                    target_point_bev=cp.asarray(target_point_bev)
-                    timing["move"]=time.perf_counter()-s
+                     rot_coords_temp=cp.empty((m,3),dtype=cp.float32)
+                     target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])])
+                     target_point_bev=cp.asarray(target_point_bev)
+                     timing["move"]=time.perf_counter()-s
 
                     # Ray calculation
                     for j in tqdm(
                         range(curr_beam["beam"]["num_of_rays"]), desc="Ray", unit="r", leave=False
                     ):
                         # Initialize Ray Geometry
-                        #curr_ray = self._init_ray(curr_beam, j)
-                        curr_ray = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev)
+                        if has_gpu:
+                         curr_ray = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev)
+
+                        else:
+                         curr_ray = self._init_ray(curr_beam, j)
+
 
 
                         # Even if the ray hits nothing, we still emit empty bixel columns
@@ -258,6 +271,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         
         timing["geo_dist_gpu"] += gpu
         timing["filling_gpu"] += filling_gpu
+        timing["geo_dist"]+=geo_dist
 
 
         # Finalize dose calculation
@@ -836,6 +850,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         lateral_ray_cutoff = self._get_lateral_distance_from_dose_cutoff_on_ray(ray)
 
         # Ray tracing for beam i and ray j
+        start=time.perf_counter()
         ix, radial_dist_sq, lat_dists, iso_lat_dists = self.calc_geo_dists(
             beam_info["bev_coords"],
             ray["source_point_bev"],
@@ -844,6 +859,8 @@ class PencilBeamEngineAbstract(DoseEngineBase):
             beam_info["valid_coords_all"],
             lateral_ray_cutoff,
         )
+        global geo_dist
+        geo_dist+=time.perf_counter()-start
 
         # Subindex given the relevant indices from the geometric distance calculation
         ray["valid_coords"] = [beam_ix & ix for beam_ix in beam_info["valid_coords"]]
@@ -1037,10 +1054,10 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         # Call the finalizeDose method from the base class
         return super()._finalize_dose(dij)
 
-
-    @staticmethod
-    @cuda.jit
-    def calc_geo_dists_gpu(
+    if has_gpu:
+     @staticmethod
+     @cuda.jit
+     def calc_geo_dists_gpu(
         rot_coords_bev, source_point_bev, target_point_bev, sad, lateral_cutoff,nb_rays,m,rot_coords_temp,subset_mask, rad_distances_sq, lat_dists,timing_buffer
     ):
         i = cuda.grid(1)
