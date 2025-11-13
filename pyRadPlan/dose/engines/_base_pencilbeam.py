@@ -1209,7 +1209,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         iso_lat_dists : Array
             Lateral distances to the central ray projected onto the isocenter plane.
         """
-
+        start=time.perf_counter()
         xp = array_api_compat.array_namespace(
             rot_coords_bev, source_point_bev, target_point_bev, rad_depth_mask
         )
@@ -1305,5 +1305,6 @@ class PencilBeamEngineAbstract(DoseEngineBase):
             iso_lat_dists = lat_dists / rot_coords_temp[sub_ix, 1][:, None] * sad
         else:
             iso_lat_dists = xp.empty_like(lat_dists)
-
+        global geo_dist
+        geo_dist+=time.perf_counter()-start
         return ix, rad_distances_sq, lat_dists, iso_lat_dists
