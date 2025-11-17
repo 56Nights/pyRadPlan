@@ -25,7 +25,7 @@ from numba import njit,cuda
 from ._base import DoseEngineBase
 from ...core.xp_utils.typing import Array
 
-has_gpu=False
+has_gpu=True
 gpu=0
 filling_gpu=0
 move=0
@@ -168,7 +168,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         "to_gpu":0
         }
         # Initialize
-        dij = self._init_dose_calc(ct, cst, stf)
+        dij = self._init_dose_calc(ct, cst, stf) #1.09 s ± 46.6 ms per loop 
 
         # We loop over scenario in the scenario model
         # TODO: we need to correctly work out scenarios
@@ -205,12 +205,12 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                     m=curr_beam["bev_coords"][curr_beam["valid_coords_all"], :].shape[0]      
                     if has_gpu:
                      s=time.perf_counter()
-                     bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :])
-                     source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) 
+                     bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :]) #1.28 ms ± 24.3 μs per loop
+                     source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) #91 μs ± 3.32 μs per loop
                         
-                     rot_coords_temp=cp.empty((m,3),dtype=cp.float32)
-                     target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])])
-                     target_point_bev=cp.asarray(target_point_bev)
+                     rot_coords_temp=cp.empty((m,3),dtype=cp.float32) #6.06 μs ± 168 ns per loop
+                     target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])]) #405 μs ± 15.3 μs per loop
+                     target_point_bev=cp.asarray(target_point_bev) #91.8 μs ± 2.16 μs per loop
                      timing["move"]=time.perf_counter()-s
 
                     # Ray calculation
@@ -548,8 +548,8 @@ class PencilBeamEngineAbstract(DoseEngineBase):
 
 
 
-        ray = beam_info["beam"]["rays"][j]
-        ray["beam_index"] = beam_info["beam_index"]
+        ray = beam_info["beam"]["rays"][j] #102 ns ± 2.89 ns per loop
+        ray["beam_index"] = beam_info["beam_index"] #94.4 ns ± 2.64 ns per loop 
         ray["ray_index"] = j
         ray["iso_center"] = beam_info["beam"]["iso_center"]
 
