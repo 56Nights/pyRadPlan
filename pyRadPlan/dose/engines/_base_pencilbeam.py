@@ -25,7 +25,7 @@ from numba import njit,cuda
 from ._base import DoseEngineBase
 from ...core.xp_utils.typing import Array
 
-has_gpu=cuda.is_available()
+has_gpu=True
 gpu=0
 filling_gpu=0
 move=0
@@ -195,14 +195,14 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                     # Initialize Beam Geometry
                     t = time.time()
                     start=time.perf_counter()
-                    curr_beam = self._init_beam(dij, ct, cst, scen_stf, i)
+                    curr_beam = self._init_beam(dij, ct, cst, scen_stf, i) #613 ms ± 18 ms per loop
                     timing["init_beam"]+=time.perf_counter()-start
 
                     logger.info("Beam %d initialized in %f seconds.", i + 1, time.time() - t)
 
                     # Keep tabs on bixels computed in this beam
                     bixel_beam_counter = 0
-                    m=curr_beam["bev_coords"][curr_beam["valid_coords_all"], :].shape[0]      
+                    m=np.count_nonzero(curr_beam["valid_coords_all"])  
                     if has_gpu:
                      s=time.perf_counter()
                      bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :]) #1.28 ms ± 24.3 μs per loop
@@ -219,10 +219,10 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                     ):
                         # Initialize Ray Geometry
                         if has_gpu:
-                         curr_ray = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev)
+                         curr_ray = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev) #7.6 ms ± 234 μs per loop
 
                         else:
-                         curr_ray = self._init_ray(curr_beam, j)
+                         curr_ray = self._init_ray(curr_beam, j) #6.14 ms ± 65.7 μs per loop 
 
 
 
@@ -240,17 +240,17 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                 # Obtain scenario index
                                 full_scen_idx = self.mult_scen.sub2scen_ix(
                                     ct_scen, shift_scen, range_scen
-                                )
+                                ) #7.88 μs ± 197 ns per loop 
 
                                 if self.mult_scen.scen_mask[full_scen_idx]:
                                     # Extract single scenario ray
                                     scen_ray = self._extract_single_scenario_ray(
                                         curr_ray, full_scen_idx
-                                    )
+                                    ) #108 μs ± 981 ns per loop
 
                                     for k in range(curr_ray["num_of_bixels"]):
                                         # Bixel Computation
-                                        curr_bixel = self._compute_bixel(scen_ray, k)
+                                        curr_bixel = self._compute_bixel(scen_ray, k) #1.15 ms ± 16.4 μs per loop
 
                                         # fill the current bixel in the sparse dose influence
                                         # matrix
@@ -263,7 +263,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                             j,
                                             k,
                                             bixel_counter + k,
-                                        )
+                                        ) #711 μs ± 272 μs per loop
 
                         # Progress Update & Bookkeeping
                         bixel_counter += curr_ray["num_of_bixels"]
@@ -575,7 +575,8 @@ class PencilBeamEngineAbstract(DoseEngineBase):
             "effective_lateral_cut_off", self._effective_lateral_cutoff
         ) #127 ns ± 1.5 ns per loop
         rad_depth_ix= beam_info["valid_coords_all"] #52.4 ns ± 0.798 ns per loop 
-        m=beam_info["bev_coords"][rad_depth_ix, :].shape[0] #995 μs ± 11.9 μs per loop       
+        #m=beam_info["bev_coords"][rad_depth_ix, :].shape[0] #995 μs ± 11.9 μs per loop   
+        m=np.count_nonzero(rad_depth_ix) #143 μs ± 1.2 μs per loop
         threads_per_block = 512 #20.2 ns ± 0.644 ns per loop
         blocks_per_grid = (m+threads_per_block-1)//threads_per_block #136 ns ± 1.43 ns per loop 
         radial_dist_sq_device=cp.empty((m),dtype=cp.float32) #6.11 μs ± 55.6 ns per loop
@@ -633,9 +634,8 @@ class PencilBeamEngineAbstract(DoseEngineBase):
          gpu +=cuda.event_elapsed_time(start_event, end_event)
         else:
         """
-        timing_buffer = cp.zeros((m, 2), dtype=cp.int64)
-        cuda.synchronize()
-        start=time.perf_counter()
+        cuda.synchronize() #14.1 μs ± 320 ns per loop
+        #start=time.perf_counter()
         nb_rays=beam_info["beam"]["num_of_rays"] #78.3 ns ± 0.83 ns per loop
         self.calc_geo_dists_gpu[blocks_per_grid, threads_per_block](
          bev_coords,
@@ -648,31 +648,47 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         rot_coords_temp,
                         subset_mask_device,
                         radial_dist_sq_device,
-                        lat_dists_device,timing_buffer
-                        ) #452 ns ± 7.94 ns per loop
+                        lat_dists_device
+                        ) #2.72 ms ± 175 μs per loop
         #end_event.record()
         #end_event.synchronize()
-        gpu +=time.perf_counter()-start
+        #gpu +=time.perf_counter()-start
         #timing = timing_buffer.copy_to_host()
         #print("Mean A:", timing[:, 0].mean(), "cycles")
-
-        subset_mask_device=subset_mask_device.astype(cp.bool_) #52.8 μs ± 940 ns per loop
+        """
+        subset_mask=subset_mask_device.astype(cp.bool_) #52.8 μs ± 940 ns per loop
         #start=time.perf_counter()
         
         subset_mask_device=subset_mask_device.get() #115 μs ± 667 ns per loop
-        radial_dist_sq_device=radial_dist_sq_device.get() #83.4 μs ± 8.47 μs per loop
-        lat_dists_device=lat_dists_device.get() #128 μs ± 10.4 μs per loop
+        radial_dist_sq=radial_dist_sq_device.get() #83.4 μs ± 8.47 μs per loop
+        lat_dists=lat_dists_device.get() #128 μs ± 10.4 μs per loop
         #move=time.perf_counter()-start
 
         ix=rad_depth_ix.copy() #7 μs ± 568 ns per loop
         rad_distances_sq_tmp = radial_dist_sq_device[subset_mask_device] #43.3 μs ± 651 ns per loop
-
-        lat_dists_tmp = lat_dists_device[subset_mask_device, :] #708 μs ± 15.1 μs per loop
+        #208 μs ± 7.42 μs per loop + 227 μs ± 6.12 μs per loop
+        
+        lat_dists_tmp_device = lat_dists_device[subset_mask_device, :] #708 μs ± 15.1 μs per loop
+        lat_dists_tmp = lat_dists_tmp_device.get() #149 μs ± 1.55 μs per loop
         ix[rad_depth_ix]=subset_mask_device #109 μs ± 2.07 μs per loop
+        """
+        subset_mask_device=subset_mask_device.astype(cp.bool_) #52.8 μs ± 940 ns per loop
+
+        rad_distances_sq_tmp = radial_dist_sq_device[subset_mask_device] #43.3 μs ± 651 ns per loop
+        lat_dists_tmp = lat_dists_device[subset_mask_device,:] #149 μs ± 1.55 μs per loop
+        subset_mask=subset_mask_device.get() #54.4 μs ± 2.35 μs per loop
+        rad_distances_sq_tmp=rad_distances_sq_tmp.get() #82.4 μs ± 9.77 μs per loop
+        lat_dists_tmp=lat_dists_tmp.get() #121 μs ± 16.6 μs per loop
+        ix=rad_depth_ix.copy() #7 μs ± 568 ns per loop
+        ix[rad_depth_ix]=subset_mask #109 μs ± 2.07 μs per loop
+        
+        
+       
+                       
                        
 
 
-        s=time.perf_counter()
+        #s=time.perf_counter()
         ray["valid_coords"] = [beam_ix & ix for beam_ix in beam_info["valid_coords"]] #8.13 μs ± 113 ns per loop
         ray["ix"] = [self._vdose_grid[ix_in_grid] for ix_in_grid in ray["valid_coords"]] #121 μs ± 1.16 μs per loop
 
@@ -696,7 +712,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         else:
            ray["rad_depth_offset"] = 0
         global filling_gpu
-        filling_gpu +=time.perf_counter()-s
+        #filling_gpu +=time.perf_counter()-s
        
 
         
@@ -1065,7 +1081,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
      @staticmethod
      @cuda.jit
      def calc_geo_dists_gpu(
-        rot_coords_bev, source_point_bev, target_point_bev, sad, lateral_cutoff,nb_rays,m,rot_coords_temp,subset_mask, rad_distances_sq, lat_dists,timing_buffer
+        rot_coords_bev, source_point_bev, target_point_bev, sad, lateral_cutoff,nb_rays,m,rot_coords_temp,subset_mask, rad_distances_sq, lat_dists
     ):
         """
          kernel which Calculate geometric distances for dose calculation.
