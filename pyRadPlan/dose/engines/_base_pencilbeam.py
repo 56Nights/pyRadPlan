@@ -25,7 +25,7 @@ from numba import njit,cuda
 from ._base import DoseEngineBase
 from ...core.xp_utils.typing import Array
 
-has_gpu=True
+has_gpu=False
 gpu=0
 filling_gpu=0
 move=0
@@ -577,7 +577,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         rad_depth_ix= beam_info["valid_coords_all"] #52.4 ns ± 0.798 ns per loop 
         #m=beam_info["bev_coords"][rad_depth_ix, :].shape[0] #995 μs ± 11.9 μs per loop   
         m=np.count_nonzero(rad_depth_ix) #143 μs ± 1.2 μs per loop
-        threads_per_block = 512 #20.2 ns ± 0.644 ns per loop
+        threads_per_block = 128 #20.2 ns ± 0.644 ns per loop
         blocks_per_grid = (m+threads_per_block-1)//threads_per_block #136 ns ± 1.43 ns per loop 
         radial_dist_sq_device=cp.empty((m),dtype=cp.float32) #6.11 μs ± 55.6 ns per loop
         lat_dists_device=cp.empty((m,2),dtype=cp.float32) #6.42 μs ± 133 ns per loop 
