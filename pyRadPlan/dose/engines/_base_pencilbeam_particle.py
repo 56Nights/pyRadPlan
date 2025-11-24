@@ -22,7 +22,7 @@ from pyRadPlan.cst import StructureSet
 from ._base_pencilbeam import PencilBeamEngineAbstract
 
 from ...core.xp_utils.compat import interp1d as array_interp
-
+import cupy as cp
 logger = logging.getLogger(__name__)
 
 
@@ -138,6 +138,74 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
 
         # Compute Bixel
         self._calc_particle_bixel(bixel)
+
+        return bixel
+    
+    def _compute_bixel_gpu(self, curr_ray: dict, k: int) -> dict:
+        # bixel = self._init_bixel(curr_ray, k) # 4.87 ms ± 30.9 μs
+        
+        bixel = curr_ray["beamlets"][k] # 35.8 ns ± 0.764 ns
+        bixel["beam_index"] = curr_ray["beam_index"] # 45.8 ns ± 0.884 ns
+        bixel["ray_index"] = curr_ray["ray_index"] # 46.1 ns ± 1.04 ns
+        bixel["bixel_index"] = k # 32.2 ns ± 1.08 ns
+        bixel["min_mu"] = 0 # 31 ns ± 1.66 ns
+        if "min_mu" in curr_ray:
+            bixel["min_mu"] = curr_ray["min_mu"][k]
+        bixel["max_mu"] = float("inf") # 83.9 ns ± 2.42 ns
+        if "max_mu" in curr_ray:
+            bixel["max_mu"] = curr_ray["max_mu"][k]
+        bixel["num_particles_per_mu"] = 1e6 # 30.5 ns ± 0.071 ns
+        if "num_particles_per_mu" in curr_ray:
+            bixel["num_particles_per_mu"] = curr_ray["num_particles_per_mu"][k]
+        energy = curr_ray["beamlets"][k]["energy"] # 47 ns ± 1.22 ns
+        energy_ix = self._machine.get_energy_index(energy, 4) # 10.7 μs ± 14.7 ns
+        if energy_ix.size > 1:
+            raise ValueError("Multiple energies found in base data for one bixel!")
+        energy_ix = np.int64(energy_ix) # 384 ns ± 0.728 ns
+        bixel["energy_ix"] = energy_ix # 32.1 ns ± 0.211 ns
+        tmp_machine = cast(ParticleAccelerator, self._machine) # 64.6 ns ± 0.37 ns
+        bixel["kernel"] = tmp_machine.get_kernel_by_index(energy_ix) # 416 ns ± 3.94 ns
+        bixel["range_shifter"] = curr_ray["beamlets"][k]["range_shifter"] # 67.6 ns ± 0.843 ns
+        bixel["SSD"] = curr_ray["SSD"] # 42.3 ns ± 0.585 ns
+        bixel["rad_depth_offset"] = curr_ray["rad_depth_offset"] # 53.6 ns ± 1.56 ns
+        bixel["sigma_ini_sq"] = curr_ray["sigma_ini"][k] ** 2 # 172 ns ± 0.621 ns
+        self._get_beam_modifiers(bixel) # 230 ns ± 1.03 ns
+###############################################################################
+        # self._get_bixel_indices_on_ray(bixel, curr_ray) # 3.32 ms ± 46.4 μs
+        kernel = cast(ParticlePencilBeamKernel, bixel["kernel"]) # 67 ns ± 1.82 ns
+        tmp_offset = kernel.offset - bixel["rad_depth_offset"] # 83.8 ns ± 0.679 ns
+        if self.dosimetric_lateral_cutoff == 1:
+            curr_ix = curr_ray["rad_depths"] <= kernel.depths[-1] + tmp_offset
+        elif 0 < self.dosimetric_lateral_cutoff < 1:
+            cutoff_info = kernel.lateral_cut_off # 24.3 ns ± 0.475 ns
+            if cutoff_info.cut_off.size > 1:
+                curr_ix = (
+                    cp.interp(
+                        curr_ray["rad_depths_gpu"],
+                        cp.asarray(cutoff_info.depths) + tmp_offset,
+                        cp.asarray(cutoff_info.cut_off)**2,
+                        left=cp.nan,
+                        right=cp.nan,
+                    )
+                    >= curr_ray["radial_dist_sq_gpu"]
+                ) & (curr_ray["rad_depths_gpu"] <= cp.asarray(kernel.depths)[-1] + tmp_offset) # 3.14 ms ± 57.6 μs
+                curr_ix=curr_ix.get()
+            else:
+                curr_ix = (cutoff_info.cut_off ** 2 >= curr_ray["radial_dist_sq"]) & (
+                    curr_ray["rad_depths"] <= kernel.depths[-1] + tmp_offset
+                )
+        else:
+            raise ValueError("dosimetric_lateral_cutoff must be a value > 0 and <= 1!")
+        bixel["sub_ix"] = curr_ix # 32.7 ns ± 1.4 ns
+        bixel["ix"] = curr_ray["ix"][curr_ix] # 108 μs ± 1.45 μs
+###############################################################################
+        bixel["radial_dist_sq"] = curr_ray["radial_dist_sq_gpu"].get()[bixel["sub_ix"]] # 101 μs ± 1.48 μs
+        bixel["rad_depths"] = curr_ray["rad_depths_gpu"].get()[bixel["sub_ix"]] # 108 μs ± 1.99 μs
+        if "lat_dists" in curr_ray:
+            bixel["lat_dists"] = curr_ray["lat_dists"][bixel["sub_ix"]] # 828 μs ± 14.5 μs
+        
+        # Compute Bixel
+        self._calc_particle_bixel(bixel) # 1.87 ms ± 63.2 μs
 
         return bixel
 

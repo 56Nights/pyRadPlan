@@ -31,7 +31,7 @@ import array_api_compat
 
 
 
-has_gpu=True
+has_gpu=False
 gpu=0
 filling_gpu=0
 move=0
@@ -255,13 +255,22 @@ class PencilBeamEngineAbstract(DoseEngineBase):
 
                                 if self.mult_scen.scen_mask[full_scen_idx]:
                                     # Extract single scenario ray
-                                    scen_ray = self._extract_single_scenario_ray(
+                                    if not has_gpu:
+                                     scen_ray = self._extract_single_scenario_ray(
                                         curr_ray, full_scen_idx
                                     ) #108 μs ± 981 ns per loop
+                                    else:
+                                     scen_ray = self._extract_single_scenario_ray_gpu(
+                                           curr_ray, full_scen_idx
+                                       ) 
+                                    
 
                                     for k in range(curr_ray["num_of_bixels"]):
                                         # Bixel Computation
-                                        curr_bixel = self._compute_bixel(scen_ray, k) #1.15 ms ± 16.4 μs per loop
+                                        if not has_gpu:
+                                         curr_bixel = self._compute_bixel(scen_ray, k) #1.15 ms ± 16.4 μs per loop
+                                        else:
+                                            curr_bixel=self._compute_bixel_gpu(scen_ray, k)
 
 
                                         # fill the current bixel in the sparse dose influence
@@ -725,8 +734,8 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         ] #118 μs ± 1.36 μs per loop
         
         
-        ray["rad_depths_gpu"]=ray["rad_depths"]
-        ray["radial_dist_sq_gpu"]=ray["radial_dist_sq"]
+        ray["rad_depths_gpu"]=ray["rad_depths"].copy()
+        ray["radial_dist_sq_gpu"]=ray["radial_dist_sq"].copy()
         ray["valid_coords"][0] = ray["valid_coords"][0].get()
         ray["ix"][0] = ray["ix"][0].get()
 
@@ -893,6 +902,50 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         if self.mult_scen.abs_range_shift[scen_num] < 0:
             # TODO: better way to handle this?
             scen_ray["rad_depths"][scen_ray["rad_depths"] < 0] = 0
+
+        if "geo_depths" in scen_ray:
+            scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen]
+
+        if "lat_dists" in scen_ray:
+            scen_ray["lat_dists"] = scen_ray["lat_dists"][ct_scen]
+
+        if "iso_lat_dists" in scen_ray:
+            scen_ray["iso_lat_dists"] = scen_ray["iso_lat_dists"][ct_scen]
+
+        return scen_ray
+    
+    def _extract_single_scenario_ray_gpu(self, ray: dict, scen_idx: int):
+        """
+        Extract a single scenario ray and adapt radiological depths.
+
+        Parameters
+        ----------
+        ray (dict):
+            The ray data.
+        scen_idx (int):
+            The scenario index.
+
+        Returns
+        -------
+        dict:
+            The scenario ray with adapted radiological depths.
+        """
+        # Gets number of scenario
+        scen_num = self.mult_scen.scen_num(scen_idx)
+        ct_scen = self.mult_scen.linear_mask[0][scen_num]
+
+        # First, create a ray of the specific scenario to adapt rad depths
+        scen_ray = ray.copy()
+        scen_ray["rad_depths_gpu"] = scen_ray["rad_depths_gpu"][ct_scen]
+        scen_ray["rad_depths_gpu"] = (1 + cp.asarray(self.mult_scen.rel_range_shift[scen_num])) * scen_ray[
+            "rad_depths_gpu"
+        ] + cp.asarray(self.mult_scen.abs_range_shift[scen_num])
+        scen_ray["radial_dist_sq_gpu"] = scen_ray["radial_dist_sq_gpu"][ct_scen]
+        scen_ray["ix"] = scen_ray["ix"][ct_scen]
+
+        if self.mult_scen.abs_range_shift[scen_num] < 0:
+            # TODO: better way to handle this?
+            scen_ray["rad_depths_gpu"][scen_ray["rad_depths_gpu"] < 0] = 0
 
         if "geo_depths" in scen_ray:
             scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen]
