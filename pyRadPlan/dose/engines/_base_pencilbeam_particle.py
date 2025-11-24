@@ -22,9 +22,12 @@ from pyRadPlan.cst import StructureSet
 from ._base_pencilbeam import PencilBeamEngineAbstract
 
 from ...core.xp_utils.compat import interp1d as array_interp
-import cupy as cp
+
 logger = logging.getLogger(__name__)
 
+has_gpu=True
+if has_gpu:
+    import cupy as cp
 
 class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
     """
@@ -141,7 +144,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
 
         return bixel
     
-    def _compute_bixel_gpu(self, curr_ray: dict, k: int) -> dict:
+    def _compute_bixel_gpu(self, curr_ray: dict, curr_ray_gpu, k: int) -> dict:
         # bixel = self._init_bixel(curr_ray, k) # 4.87 ms ± 30.9 μs
         
         bixel = curr_ray["beamlets"][k] # 35.8 ns ± 0.764 ns
@@ -175,39 +178,68 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         kernel = cast(ParticlePencilBeamKernel, bixel["kernel"]) # 67 ns ± 1.82 ns
         tmp_offset = kernel.offset - bixel["rad_depth_offset"] # 83.8 ns ± 0.679 ns
         if self.dosimetric_lateral_cutoff == 1:
-            curr_ix = curr_ray["rad_depths"] <= kernel.depths[-1] + tmp_offset
+            curr_ix_gpu = curr_ray_gpu["rad_depths"] <= kernel.depths[-1] + tmp_offset
         elif 0 < self.dosimetric_lateral_cutoff < 1:
             cutoff_info = kernel.lateral_cut_off # 24.3 ns ± 0.475 ns
+            
             if cutoff_info.cut_off.size > 1:
-                curr_ix = (
-                    cp.interp(
-                        curr_ray["rad_depths_gpu"],
-                        cp.asarray(cutoff_info.depths) + tmp_offset,
-                        cp.asarray(cutoff_info.cut_off)**2,
-                        left=cp.nan,
-                        right=cp.nan,
-                    )
-                    >= curr_ray["radial_dist_sq_gpu"]
-                ) & (curr_ray["rad_depths_gpu"] <= cp.asarray(kernel.depths)[-1] + tmp_offset) # 3.14 ms ± 57.6 μs
-                curr_ix=curr_ix.get()
+                curr_rad_depths_gpu = curr_ray_gpu["rad_depths"] # 
+                cutoff_depths_gpu   = cp.asarray(cutoff_info.depths) # 65.4 μs ± 292 ns
+                cutoff_sq_gpu       = cp.asarray(cutoff_info.cut_off**2) # 71.3 μs ± 222 ns
+                radial_dist_sq_gpu  = curr_ray_gpu["radial_dist_sq"] # 
+                kernel_last_depth   = cp.asarray(kernel.depths[-1]) # 45.9 μs ± 1.04 μs
+                tmp_offset_gpu      = cp.asarray(tmp_offset) # 38.3 μs ± 40.8 ns
+                
+                interp_vals = cp.interp(
+                curr_rad_depths_gpu,
+                cutoff_depths_gpu + tmp_offset_gpu,
+                cutoff_sq_gpu,
+                left=cp.nan,
+                right=cp.nan,
+                ) # 
+                
+                curr_ix_gpu = (
+                (interp_vals >= radial_dist_sq_gpu)
+                & (curr_rad_depths_gpu <= kernel_last_depth + tmp_offset_gpu)
+                ) # 
             else:
-                curr_ix = (cutoff_info.cut_off ** 2 >= curr_ray["radial_dist_sq"]) & (
-                    curr_ray["rad_depths"] <= kernel.depths[-1] + tmp_offset
+                curr_ix_gpu = (cutoff_info.cut_off[0] ** 2 >= curr_ray_gpu["radial_dist_sq"]) & (
+                    curr_ray_gpu["rad_depths"] <= kernel.depths[-1] + tmp_offset
                 )
         else:
             raise ValueError("dosimetric_lateral_cutoff must be a value > 0 and <= 1!")
-        bixel["sub_ix"] = curr_ix # 32.7 ns ± 1.4 ns
-        bixel["ix"] = curr_ray["ix"][curr_ix] # 108 μs ± 1.45 μs
 ###############################################################################
-        bixel["radial_dist_sq"] = curr_ray["radial_dist_sq_gpu"].get()[bixel["sub_ix"]] # 101 μs ± 1.48 μs
-        bixel["rad_depths"] = curr_ray["rad_depths_gpu"].get()[bixel["sub_ix"]] # 108 μs ± 1.99 μs
-        if "lat_dists" in curr_ray:
-            bixel["lat_dists"] = curr_ray["lat_dists"][bixel["sub_ix"]] # 828 μs ± 14.5 μs
-        
+        # curr_ix = cp.asnumpy(curr_ix_gpu)
+        # partie a passer GPU :    
+        # bixel["sub_ix"] = curr_ix # 32.7 ns ± 1.4 ns
+        # bixel["ix"] = curr_ray["ix"][curr_ix] # 108 μs ± 1.45 μs
+        # bixel["radial_dist_sq"] = curr_ray["radial_dist_sq"][bixel["sub_ix"]] # 101 μs ± 1.48 μs
+        # bixel["rad_depths"] = curr_ray["rad_depths"][bixel["sub_ix"]] # 108 μs ± 1.99 μs
+        # if "lat_dists" in curr_ray:
+        #     bixel["lat_dists"] = curr_ray["lat_dists"][bixel["sub_ix"]] # 828 μs ± 14.5 μs
+            
+        # version GPU : 
+        bixel_sub_ix_gpu = curr_ix_gpu
+        bixel_ix_gpu = curr_ray_gpu["ix"][curr_ix_gpu]
+        bixel_radial_dist_sq_gpu = curr_ray_gpu["radial_dist_sq"][bixel_sub_ix_gpu] # 
+        bixel_rad_depth_gpu = curr_ray_gpu["rad_depths"][bixel_sub_ix_gpu] # 
+        if "lat_dists" in curr_ray_gpu:
+            bixel_lat_dists_gpu = curr_ray_gpu["lat_dists"][bixel_sub_ix_gpu] # 
+            bixel["lat_dists"] = cp.asnumpy(bixel_lat_dists_gpu)
+            
+        bixel["sub_ix"] =cp.asnumpy(bixel_sub_ix_gpu)
+        bixel["ix"] = cp.asnumpy(bixel_ix_gpu)
+        bixel["radial_dist_sq"] =cp.asnumpy(bixel_radial_dist_sq_gpu)
+        bixel["rad_depths"] =cp.asnumpy(bixel_rad_depth_gpu)
+###############################################################################        
         # Compute Bixel
-        self._calc_particle_bixel(bixel) # 1.87 ms ± 63.2 μs
+        self._calc_particle_bixel_gpu(bixel,bixel_radial_dist_sq_gpu) # 
+        #self._calc_particle_bixel(bixel) # 
 
+        
         return bixel
+
+    
 
     def _init_bixel(self, curr_ray, k):
         """
@@ -350,7 +382,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
             ray["sad"],
             beam_info["valid_coords_all"],
             lateral_ray_cutoff,
-        )
+        ) #45.9 ms ± 1.96 ms a 2,2,2
 
         # Subindex given the relevant indices from the geometric distance calculation
         ray["valid_coords"] = [beam_ix & ix for beam_ix in beam_info["valid_coords"]]
@@ -934,8 +966,8 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         scen_ray = super()._extract_single_scenario_ray(ray, scen_idx)
         # TODO: Add multscen support
         # Gets number of scenario
-        scen_num = 1  # self.mult_scen['scenNum'][scen_idx]
-        ct_scen = self.mult_scen.linear_mask[0][scen_num]
+        scen_num = 1  # 15.4 ns ± 0.431 ns
+        ct_scen = self.mult_scen.linear_mask[0][scen_num] # 1.61 μs ± 21.1 ns 
 
         if "vTissueIndex" in scen_ray:
             scen_ray["vTissueIndex"] = scen_ray["vTissueIndex"][ct_scen]

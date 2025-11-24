@@ -25,13 +25,9 @@ from numba import njit,cuda
 from ._base import DoseEngineBase
 from ...core.xp_utils.typing import Array
 
-import array_api_compat
+#has_gpu=cuda.is_available()
+has_gpu=True
 
-
-
-
-
-has_gpu=False
 gpu=0
 filling_gpu=0
 move=0
@@ -41,10 +37,7 @@ logger = logging.getLogger(__name__)
 if has_gpu:
     import cupy as cp
     #from numba import njit,cuda
-
-
-
-
+    
 class PencilBeamEngineAbstract(DoseEngineBase):
     """
     An abstract class representing the Pencil Beam Engine.
@@ -201,41 +194,38 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                     # Initialize Beam Geometry
                     t = time.time()
                     start=time.perf_counter()
-                    curr_beam = self._init_beam(dij, ct, cst, scen_stf, i) #613 ms ± 18 ms per loop
+                    curr_beam = self._init_beam(dij, ct, cst, scen_stf, i)
                     timing["init_beam"]+=time.perf_counter()-start
 
                     logger.info("Beam %d initialized in %f seconds.", i + 1, time.time() - t)
 
                     # Keep tabs on bixels computed in this beam
                     bixel_beam_counter = 0
+                    
                     if has_gpu:
-                     m=np.count_nonzero(curr_beam["valid_coords_all"])  
-                     s=time.perf_counter()
-                     bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :]) #1.28 ms ± 24.3 μs per loop
-                     source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) #91 μs ± 3.32 μs per loop
-                        
-                     rot_coords_temp=cp.empty((m,3),dtype=cp.float32) #6.06 μs ± 168 ns per loop
-                     target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])]) #405 μs ± 15.3 μs per loop
-                     target_point_bev=cp.asarray(target_point_bev) #91.8 μs ± 2.16 μs per loop
+                     m = np.count_nonzero(curr_beam["valid_coords_all"]) # 71.5 μs ± 357 ns
+                     bev_coords=cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :]) # 12.1 ms ± 295 μs
+                     source_point_bev=cp.asarray(curr_beam["beam"]["source_point_bev"]) # 65.7 μs ± 384 ns
+                     rot_coords_temp=cp.empty((m,3),dtype=cp.float32) # 4.23 μs ± 74.1 ns per loop
+                     target_point_bev=np.vstack([curr_beam["beam"]["rays"][j]["target_point_bev"] for j in range(curr_beam["beam"]["num_of_rays"])]) # 208 μs ± 2.26 μs 
+                     target_point_bev=cp.asarray(target_point_bev) # 69.5 μs ± 1.22 μs
+                     beam_valid_coords_all_device = cp.asarray(curr_beam["valid_coords_all"]) # 256 μs ± 4.26 μs
+                     beam_valid_coords_device= cp.asarray(curr_beam["valid_coords"][0]) #257 μs ± 3.93 μs
+                     vdose_grid_device = cp.asarray(self._vdose_grid) # 1.67 ms ± 54.6 μs
+                     beam_geo_depth = cp.asarray(curr_beam["geo_depths"][0]) # 2.01 ms ± 448 μs
+                     beam_rad_depths = cp.asarray(curr_beam["rad_depths"][0]) # 1.24 ms ± 329 μs
+                     ix_device = beam_valid_coords_all_device.copy() # 90.8 μs ± 5 μs  
                      
-                     beam_geo_depths=curr_beam["geo_depths"].copy()
-                     beam_rad_depths=curr_beam["rad_depths"].copy()
-                     beam_valid_coords=curr_beam["valid_coords"].copy()
-                     vdose_grid=cp.asarray(self._vdose_grid)
-                     timing["move"]=time.perf_counter()-s
-
                     # Ray calculation
                     for j in tqdm(
                         range(curr_beam["beam"]["num_of_rays"]), desc="Ray", unit="r", leave=False
                     ):
+                        start = time.perf_counter()
                         # Initialize Ray Geometry
                         if has_gpu:
-                         curr_ray = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_geo_depths,beam_rad_depths,beam_valid_coords,vdose_grid) #7.6 ms ± 234 μs per loop
-
+                         curr_ray, curr_ray_gpu = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device,beam_geo_depth,beam_rad_depths,ix_device) # 
                         else:
-                         curr_ray = self._init_ray(curr_beam, j) #6.14 ms ± 65.7 μs per loop 
-
-
+                         curr_ray = self._init_ray(curr_beam, j) # 59.1 ms ± 1.46 ms
 
                         # Even if the ray hits nothing, we still emit empty bixel columns
                         # so that CSC structures and bookkeeping stay consistent.
@@ -249,32 +239,25 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         for ct_scen in range(self.mult_scen.num_of_ct_scen):
                             for range_scen in range(self.mult_scen.tot_num_range_scen):
                                 # Obtain scenario index
-                                full_scen_idx = self.mult_scen.sub2scen_ix(
-                                    ct_scen, shift_scen, range_scen
-                                ) #7.88 μs ± 197 ns per loop 
+                                full_scen_idx = self.mult_scen.sub2scen_ix(ct_scen, shift_scen, range_scen) # 2.69 μs ± 6.19 ns
 
                                 if self.mult_scen.scen_mask[full_scen_idx]:
                                     # Extract single scenario ray
-                                    if not has_gpu:
-                                     scen_ray = self._extract_single_scenario_ray(
-                                        curr_ray, full_scen_idx
-                                    ) #108 μs ± 981 ns per loop
-                                    else:
-                                     scen_ray = self._extract_single_scenario_ray_gpu(
-                                           curr_ray, full_scen_idx
-                                       ) 
-                                    
-
+                                    if has_gpu :
+                                        scen_ray ,scen_ray_gpu = self._extract_single_scenario_ray_gpu(curr_ray,curr_ray_gpu, full_scen_idx) # 
+                                        # print('calculate single scen gpu')
+                                    else :
+                                        scen_ray = self._extract_single_scenario_ray(curr_ray, full_scen_idx) # 1.46 ms ± 4.84 μs
                                     for k in range(curr_ray["num_of_bixels"]):
                                         # Bixel Computation
-                                        if not has_gpu:
-                                         curr_bixel = self._compute_bixel(scen_ray, k) #1.15 ms ± 16.4 μs per loop
-                                        else:
-                                            curr_bixel=self._compute_bixel_gpu(scen_ray, k)
-
+                                        if has_gpu : 
+                                            curr_bixel = self._compute_bixel_gpu(scen_ray, scen_ray_gpu,k) #
+                                        else :
+                                            curr_bixel = self._compute_bixel(scen_ray, k) # 6.87 ms ± 28 μs
 
                                         # fill the current bixel in the sparse dose influence
                                         # matrix
+                                        
                                         self._fill_dij(
                                             curr_bixel,
                                             dij,
@@ -284,14 +267,12 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                             j,
                                             k,
                                             bixel_counter + k,
-                                        ) #711 μs ± 272 μs per loop
+                                        )
 
                         # Progress Update & Bookkeeping
                         bixel_counter += curr_ray["num_of_bixels"]
                         bixel_beam_counter += curr_ray["num_of_bixels"]
-                        
-        timing["geo_dist_gpu"] += gpu
-        timing["filling_gpu"] += filling_gpu
+                        # print(time.perf_counter()-start)
         timing["geo_dist"]+=geo_dist
 
 
@@ -549,7 +530,8 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         self._get_ray_geometry_from_beam(ray, beam_info)
 
         return ray
-    def _init_ray_gpu(self, beam_info: dict[str], j: int,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_geo_depths,beam_rad_depths,beam_valid_coords,vdose_grid) -> dict[str]:
+    
+    def _init_ray_gpu(self, beam_info: dict[str], j: int,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device, beam_geo_depth, beam_rad_depths,ix_device) -> dict[str]:
         """
         Initialize a ray for pencil beam dose calculation.
 
@@ -566,207 +548,88 @@ class PencilBeamEngineAbstract(DoseEngineBase):
             temporary variable to hold the rotation matrix used in calc_geo_dists_gpu
         target_point_bev:Array
             the 3D coordinate of the target point of the ray
-        m:int
 
         Returns
         -------
         dict
             The initialized ray.
         """
-        global gpu,move,filling_gpu
 
-
-        ray = beam_info["beam"]["rays"][j] #102 ns ± 2.89 ns per loop
-        ray["beam_index"] = beam_info["beam_index"] #94.4 ns ± 2.64 ns per loop 
-        ray["ray_index"] = j #65 ns ± 1.13 ns per loop
-        ray["iso_center"] = beam_info["beam"]["iso_center"] #117 ns ± 1.35 ns per loop
+        ray = beam_info["beam"]["rays"][j] # 49.1 ns ± 0.599 ns
+        ray["beam_index"] = beam_info["beam_index"] # 43.1 ns ± 0.54 ns
+        ray["ray_index"] = j # 34.2 ns ± 1.02 ns
+        ray["iso_center"] = beam_info["beam"]["iso_center"] # 56.2 ns ± 2.17 ns
 
         if "num_of_bixels_per_ray" in beam_info["beam"]:
-            ray["num_of_bixels"] = beam_info["beam"]["num_of_bixels_per_ray"][j] #234 ns ± 6.02 ns per loop 
+            ray["num_of_bixels"] = beam_info["beam"]["num_of_bixels_per_ray"][j] # 108 ns ± 2.52 ns
         else:
             # Fallback: use the actual number of beamlets on this ray
             # This is needed for machines like "Focused" that don't precompute counts.
             ray["num_of_bixels"] = len(ray.get("beamlets", [])) or 0
 
-        ray["source_point_bev"] = beam_info["beam"]["source_point_bev"] #118 ns ± 2.2 ns per loop
-        ray["sad"] = beam_info["beam"]["sad"] #120 ns ± 1.39 ns per loop
-        ray["bixel_width"] = beam_info["beam"]["bixel_width"] #119 ns ± 1.57 ns per loop
-
-        ray["effective_lateral_cut_off"] = beam_info.get(
-            "effective_lateral_cut_off", self._effective_lateral_cutoff
-        ) #127 ns ± 1.5 ns per loop
-        rad_depth_ix= beam_info["valid_coords_all"] #52.4 ns ± 0.798 ns per loop 
-        threads_per_block = 128 #20.2 ns ± 0.644 ns per loop
-        blocks_per_grid = (m+threads_per_block-1)//threads_per_block #136 ns ± 1.43 ns per loop 
-        radial_dist_sq_device=cp.empty((m),dtype=cp.float32) #6.11 μs ± 55.6 ns per loop
-        lat_dists_device=cp.empty((m,2),dtype=cp.float32) #6.42 μs ± 133 ns per loop 
-        subset_mask_device=cp.empty((m),dtype=cp.int32) #6.11 μs ± 119 ns per loop 
-        """
-        a0 = -ray["source_point_bev"][0]
-        a1 = -ray["source_point_bev"][1]
-        a2 = -ray["source_point_bev"][2]
-
-        norm_a = math.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
-
-        a0 /= norm_a
-        a1 /= norm_a
-        a2 /= norm_a
+        ray["source_point_bev"] = beam_info["beam"]["source_point_bev"] # 54.6 ns ± 0.952 ns
+        ray["sad"] = beam_info["beam"]["sad"] # 54.2 ns ± 1.85 ns
+        ray["bixel_width"] = beam_info["beam"]["bixel_width"] # 54.1 ns ± 1.79 ns
+        ray["effective_lateral_cut_off"] = beam_info.get("effective_lateral_cut_off", self._effective_lateral_cutoff) # 65.4 ns ± 0.258 ns 
+        rad_depth_ix= beam_info["valid_coords_all"] # 28.3 ns ± 1.17 ns
 
 
-        bx = ray["target_point_bev"][0] - ray["source_point_bev"][0]
-        by = ray["target_point_bev"][1] - ray["source_point_bev"][1]
-        bz = ray["target_point_bev"][2] - ray["source_point_bev"][2]
+        threads_per_block = 256 # 15.7 ns ± 0.772 ns
+        blocks_per_grid = (m+threads_per_block-1)//threads_per_block # 72.7 ns ± 2.32 ns
+        radial_dist_sq_device=cp.empty((m),dtype=cp.float32) # 3.9 μs ± 22.5 ns
+        lat_dists_device=cp.empty((m,2),dtype=cp.float32) # 4.01 μs ± 25.7 ns
+        subset_mask_device=cp.empty((m),dtype=cp.int32) # 4.05 μs ± 40.7 ns
 
-        norm_b = math.sqrt(bx*bx + by*by + bz*bz)
-        bx /= norm_b
-        by /= norm_b
-        bz /= norm_b
-
-        cx = a1 * bz - a2 * by
-        cy = a2 * bx - a0 * bz
-        cz = a0 * by - a1 * bx
-        cnorm=math.sqrt(cx * cx + cy * cy + cz * cz)
-        tolerance = 1e-7
-        """
-       
-        """
-        if abs(a0 - bx) < tolerance and abs(a1 - by) < tolerance and abs(a2 - bz) < tolerance:
-         cuda.synchronize()
-         start_event.record()
-         self.calc_geo_dists_gpu1[blocks_per_grid, threads_per_block](
-         bev_coords,
-         source_point_bev,
-                        ray["sad"],
-                        self._get_lateral_distance_from_dose_cutoff_on_ray(ray),
-                        m,
-                        rot_coords_temp,
-                        subset_mask_device,
-                        radial_dist_sq_device,
-                        lat_dists_device
-                        )
-         end_event.record()
-         end_event.synchronize()
-         gpu +=cuda.event_elapsed_time(start_event, end_event)
-        else:
-        """
-        #cuda.synchronize() #14.1 μs ± 320 ns per loop
-        #start=time.perf_counter()
-        nb_rays=beam_info["beam"]["num_of_rays"] #78.3 ns ± 0.83 ns per loop
+        #cuda.synchronize() # 
+        nb_rays=beam_info["beam"]["num_of_rays"] # 39.5 ns ± 1.36 ns
         self.calc_geo_dists_gpu[blocks_per_grid, threads_per_block](
-         bev_coords,
-         source_point_bev,
-         target_point_bev[j],
-                        ray["sad"],
-                        self._get_lateral_distance_from_dose_cutoff_on_ray(ray),
-                        nb_rays,
-                        m,
-                        rot_coords_temp,
-                        subset_mask_device,
-                        radial_dist_sq_device,
-                        lat_dists_device
-                        ) #2.72 ms ± 175 μs per loop
-        #end_event.record()
-        #end_event.synchronize()
-        #gpu +=time.perf_counter()-start
-        #timing = timing_buffer.copy_to_host()
-        #print("Mean A:", timing[:, 0].mean(), "cycles")
-        """
-        subset_mask=subset_mask_device.astype(cp.bool_) #52.8 μs ± 940 ns per loop
-        #start=time.perf_counter()
+        bev_coords,
+        source_point_bev,
+        target_point_bev[j],
+        ray["sad"],
+        self._get_lateral_distance_from_dose_cutoff_on_ray(ray),
+        nb_rays,
+        m,
+        rot_coords_temp,
+        subset_mask_device,
+        radial_dist_sq_device,
+        lat_dists_device
+        ) # 5.77 ms ± 1.6 ms (x6 pour la premiere compilation)
+                                    
+        subset_mask_device = subset_mask_device.astype(cp.bool_) # 34.3 μs ± 281 ns
+        idx = cp.nonzero(subset_mask_device)[0] # 236 μs ± 983 ns
+        radial_dist_sq_device = cp.take(radial_dist_sq_device, idx) # 55.3 μs ± 711 ns
+        lat_dists_device = cp.take(lat_dists_device, idx, axis=0) # 112 μs ± 7.05 μs
+        ix_device[beam_valid_coords_all_device] = subset_mask_device # 510 μs ± 83.3 μs
+        # # SOUS_TOT_BLOCK = 1.0 ms (1038 μs)
         
-        subset_mask_device=subset_mask_device.get() #115 μs ± 667 ns per loop
-        radial_dist_sq=radial_dist_sq_device.get() #83.4 μs ± 8.47 μs per loop
-        lat_dists=lat_dists_device.get() #128 μs ± 10.4 μs per loop
-        #move=time.perf_counter()-start
-
-        ix=rad_depth_ix.copy() #7 μs ± 568 ns per loop
-        rad_distances_sq_tmp = radial_dist_sq_device[subset_mask_device] #43.3 μs ± 651 ns per loop
-        #208 μs ± 7.42 μs per loop + 227 μs ± 6.12 μs per loop
+        ray_valid_coords_device = ix_device & beam_valid_coords_device # 98.8 μs ± 6.98 μs
+        ray_ix_device = vdose_grid_device[ray_valid_coords_device] # 502 μs ± 83.6 μs
+        ray_radial_dist_sq_device = radial_dist_sq_device[ray_valid_coords_device[ix_device]] # 734 μs ± 60.2 μs
+        ray_lat_dists_device = lat_dists_device[ray_valid_coords_device[ix_device]] # 965 μs ± 66.2 μs
+        ray_valid_coords_all_device = cp.asarray([cp.any(ray_valid_coords_device)]) # 150 μs ± 1.45 μs
+        ray_geo_depths_device = beam_geo_depth[ray_valid_coords_device] # 493 μs ± 81.7 μs
+        ray_rad_depths_device = beam_rad_depths[ray_valid_coords_device] # 427 μs ± 14.3 μs
+        ray_gpu = {"valid_coords": [ray_valid_coords_device],
+                   "ix": [ray_ix_device],
+                   "radial_dist_sq": [ray_radial_dist_sq_device],
+                   "lat_dists": [ray_lat_dists_device],
+                   "valid_coords_all": [ray_valid_coords_all_device],
+                   "geo_depths": [ray_geo_depths_device],
+                   "rad_depths": [ray_rad_depths_device],
+                   } # 192 ns ± 1.96 ns
+        # SOUS_TOT_BLOCK = 3.3 ms (3370 μs)
+        # SOUS_TOT_BLOCK = 4.7 ms (4653 μs)
+        # TOTAL_SECTION = 9.1 ms (9061 μs)
         
-        lat_dists_tmp_device = lat_dists_device[subset_mask_device, :] #708 μs ± 15.1 μs per loop
-        lat_dists_tmp = lat_dists_tmp_device.get() #149 μs ± 1.55 μs per loop
-        ix[rad_depth_ix]=subset_mask_device #109 μs ± 2.07 μs per loop
-        """
-        """
-        subset_mask_device=subset_mask_device.astype(cp.bool_) #52.8 μs ± 940 ns per loop
-
-        rad_distances_sq_tmp = radial_dist_sq_device[subset_mask_device] #43.3 μs ± 651 ns per loop
-        lat_dists_tmp = lat_dists_device[subset_mask_device,:] #149 μs ± 1.55 μs per loop
-        subset_mask=subset_mask_device.get() #54.4 μs ± 2.35 μs per loop
-        rad_distances_sq_tmp=rad_distances_sq_tmp.get() #82.4 μs ± 9.77 μs per loop
-        lat_dists_tmp=lat_dists_tmp.get() #121 μs ± 16.6 μs per loop
-        ix=rad_depth_ix.copy() #7 μs ± 568 ns per loop
-        ix[rad_depth_ix]=subset_mask #109 μs ± 2.07 μs per loop
-        
-        """
-        subset_mask_device=subset_mask_device.astype(cp.bool_) #52.8 μs ± 940 ns per loop
-
-        rad_distances_sq_tmp = radial_dist_sq_device[subset_mask_device] #43.3 μs ± 651 ns per loop
-        lat_dists_tmp = lat_dists_device[subset_mask_device,:] #149 μs ± 1.55 μs per loop
-        ix=cp.asarray(rad_depth_ix.copy()) #7 μs ± 568 ns per loop
-        ix[cp.asarray(rad_depth_ix)]=subset_mask_device #109 μs ± 2.07 μs per loop
-        
-        
-        
-        
-        beam_geo_depths[0]=cp.asarray(beam_geo_depths[0])
-        beam_rad_depths[0]=cp.asarray(beam_rad_depths[0])
-        beam_valid_coords[0]=cp.asarray(beam_valid_coords[0])
-        
-
-                       
-
-
-        ray["valid_coords"] = [ix & beam_valid_coords[0]] #8.13 μs ± 113 ns per loop
-        ray["ix"] = [vdose_grid[ray["valid_coords"][0]]] #121 μs ± 1.16 μs per loop
-
-        ray["radial_dist_sq"] = [rad_distances_sq_tmp[ray["valid_coords"][0][ix]]] #143 μs ± 1.72 μs per loop
-
-        ray["lat_dists"] = [lat_dists_tmp[ray["valid_coords"][0][ix]]] #799 μs ± 13.1 μs per loop 
-
-        ray["valid_coords_all"] = cp.any(cp.vstack(ray["valid_coords"]), axis=1) #18.2 μs ± 500 ns per loop
-
-        ray["geo_depths"] = [
-                        beam_geo_depths[0][ray["valid_coords"][0]]
-                        ]  #122 μs ± 2.35 μs per loop
-        ray["rad_depths"] = [
-                        beam_rad_depths[0][ray["valid_coords"][0]]
-                        ] #118 μs ± 1.36 μs per loop
-        
-        
-        ray["rad_depths_gpu"]=ray["rad_depths"].copy()
-        ray["radial_dist_sq_gpu"]=ray["radial_dist_sq"].copy()
-        ray["valid_coords"][0] = ray["valid_coords"][0].get()
-        ray["ix"][0] = ray["ix"][0].get()
-
-        ray["radial_dist_sq"][0] = ray["radial_dist_sq"][0].get()
-
-        ray["lat_dists"][0] =  ray["lat_dists"][0].get() 
-
-        ray["valid_coords_all"][0] = ray["valid_coords_all"][0].get()
-
-        ray["geo_depths"][0] =  ray["geo_depths"][0].get()
-        ray["rad_depths"][0]= ray["rad_depths"][0].get()
-        
-        
-        
-        
-        
-                    
-        ray["sigma_ini"] = self._calc_sigma_ini_on_ray(ray) #105 μs ± 1.3 μs per loop 
+        ray["sigma_ini"] = self._calc_sigma_ini_on_ray(ray) # 67.8 μs ± 458 ns
         if self.air_offset_correction:
-           nozzle_to_skin = (ray["SSD"] + self._machine.bams_to_iso_dist) - self._machine.sad #237 ns ± 5.75 ns per loop 
-           ray["rad_depth_offset"] = 0.0011 * (nozzle_to_skin - self._machine.fit_air_offset) #174 ns ± 1.96 ns per loop
+           nozzle_to_skin = (ray["SSD"] + self._machine.bams_to_iso_dist) - self._machine.sad # 82.1 ns ± 2.65 ns
+           ray["rad_depth_offset"] = 0.0011 * (nozzle_to_skin - self._machine.fit_air_offset) # 75.2 ns ± 2.31 ns
         else:
-           ray["rad_depth_offset"] = 0
-        global filling_gpu
-        #filling_gpu +=time.perf_counter()-s
-       
+           ray["rad_depth_offset"] = 0 # 
 
-        
-
-
-        return ray
+        return ray, ray_gpu
 
     def _compute_ssd(
         self,
@@ -887,119 +750,60 @@ class PencilBeamEngineAbstract(DoseEngineBase):
             The scenario ray with adapted radiological depths.
         """
         # Gets number of scenario
-        scen_num = self.mult_scen.scen_num(scen_idx)
-        ct_scen = self.mult_scen.linear_mask[0][scen_num]
+        scen_num = self.mult_scen.scen_num(scen_idx) # 4.92 μs ± 38.9 ns
+        ct_scen = self.mult_scen.linear_mask[0][scen_num] # 1.63 μs ± 9.53 ns
 
         # First, create a ray of the specific scenario to adapt rad depths
-        scen_ray = ray.copy()
-        scen_ray["rad_depths"] = scen_ray["rad_depths"][ct_scen]
+        scen_ray = ray.copy() # 142 ns ± 1.02 ns
+        scen_ray["rad_depths"] = scen_ray["rad_depths"][ct_scen] # 61 ns ± 1.24 ns
         scen_ray["rad_depths"] = (1 + self.mult_scen.rel_range_shift[scen_num]) * scen_ray[
             "rad_depths"
-        ] + self.mult_scen.abs_range_shift[scen_num]
-        scen_ray["radial_dist_sq"] = scen_ray["radial_dist_sq"][ct_scen]
-        scen_ray["ix"] = scen_ray["ix"][ct_scen]
+        ] + self.mult_scen.abs_range_shift[scen_num] # 3.41 μs ± 15.1 ns
+        scen_ray["radial_dist_sq"] = scen_ray["radial_dist_sq"][ct_scen] # 61.5 ns ± 2.05 ns
+        scen_ray["ix"] = scen_ray["ix"][ct_scen] # 61.9 ns ± 2.64 ns
 
         if self.mult_scen.abs_range_shift[scen_num] < 0:
             # TODO: better way to handle this?
             scen_ray["rad_depths"][scen_ray["rad_depths"] < 0] = 0
 
         if "geo_depths" in scen_ray:
-            scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen]
+            scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen] # 62.6 ns ± 1.3 ns
 
         if "lat_dists" in scen_ray:
-            scen_ray["lat_dists"] = scen_ray["lat_dists"][ct_scen]
+            scen_ray["lat_dists"] = scen_ray["lat_dists"][ct_scen] # 60 ns ± 1.04 ns
 
         if "iso_lat_dists" in scen_ray:
             scen_ray["iso_lat_dists"] = scen_ray["iso_lat_dists"][ct_scen]
 
         return scen_ray
-    
-    def _extract_single_scenario_ray_gpu(self, ray: dict, scen_idx: int):
-        """
-        Extract a single scenario ray and adapt radiological depths.
 
-        Parameters
-        ----------
-        ray (dict):
-            The ray data.
-        scen_idx (int):
-            The scenario index.
+    def _extract_single_scenario_ray_gpu(self, ray: dict, ray_gpu, scen_idx: int):
+        # lignes communes indispensables
+       scen_num = self.mult_scen.scen_num(scen_idx) # 4.92 μs ± 38.9 ns
+       ct_scen = self.mult_scen.linear_mask[0][scen_num] # 1.63 μs ± 9.53 ns
+       
+       #  version GPU
+       scen_ray_gpu = ray_gpu.copy() # 69.4 ns ± 0.488 ns
+       scen_ray_gpu["rad_depths"] = scen_ray_gpu["rad_depths"][ct_scen] # 58.2 μs ± 206 ns
+       scen_ray_gpu["rad_depths"] = (1 + self.mult_scen.rel_range_shift[scen_num]) * scen_ray_gpu[
+           "rad_depths"
+       ] + self.mult_scen.abs_range_shift[scen_num] # 111 μs ± 6.26 μs
+       scen_ray_gpu["radial_dist_sq"] = scen_ray_gpu["radial_dist_sq"][ct_scen] # 52.7 μs ± 847 ns
+       scen_ray_gpu["ix"] = scen_ray_gpu["ix"][ct_scen] # 54 μs ± 1.26 μs
+       if self.mult_scen.abs_range_shift[scen_num] < 0:
+           scen_ray_gpu["rad_depths"][scen_ray_gpu["rad_depths"] < 0] = 0
+       if "geo_depths" in scen_ray_gpu:
+           scen_ray_gpu["geo_depths"] = scen_ray_gpu["geo_depths"][ct_scen] # 54.6 μs ± 1.46 μs
+       if "lat_dists" in scen_ray_gpu:
+           scen_ray_gpu["lat_dists"] = scen_ray_gpu["lat_dists"][ct_scen] # 60.8 μs ± 1.54 μs
+       if "iso_lat_dists" in scen_ray_gpu:
+           scen_ray_gpu["iso_lat_dists"] = scen_ray_gpu["iso_lat_dists"][ct_scen]
+       # la version GPU est allourdie par la gestion en dictionnaires, peut être sous optimal.
+       
+       # partie CPU
+       scen_ray = ray.copy() # 142 ns ± 1.02 ns
 
-        Returns
-        -------
-        dict:
-            The scenario ray with adapted radiological depths.
-        """
-        # Gets number of scenario
-        scen_num = self.mult_scen.scen_num(scen_idx)
-        ct_scen = self.mult_scen.linear_mask[0][scen_num]
-
-        # First, create a ray of the specific scenario to adapt rad depths
-        scen_ray = ray.copy()
-        scen_ray["rad_depths_gpu"] = scen_ray["rad_depths_gpu"][ct_scen]
-        scen_ray["rad_depths_gpu"] = (1 + cp.asarray(self.mult_scen.rel_range_shift[scen_num])) * scen_ray[
-            "rad_depths_gpu"
-        ] + cp.asarray(self.mult_scen.abs_range_shift[scen_num])
-        scen_ray["radial_dist_sq_gpu"] = scen_ray["radial_dist_sq_gpu"][ct_scen]
-        scen_ray["ix"] = scen_ray["ix"][ct_scen]
-
-        if self.mult_scen.abs_range_shift[scen_num] < 0:
-            # TODO: better way to handle this?
-            scen_ray["rad_depths_gpu"][scen_ray["rad_depths_gpu"] < 0] = 0
-
-        if "geo_depths" in scen_ray:
-            scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen]
-
-        if "lat_dists" in scen_ray:
-            scen_ray["lat_dists"] = scen_ray["lat_dists"][ct_scen]
-
-        if "iso_lat_dists" in scen_ray:
-            scen_ray["iso_lat_dists"] = scen_ray["iso_lat_dists"][ct_scen]
-
-        return scen_ray
-    
-    def _extract_single_scenario_ray_gpu(self, ray: dict, scen_idx: int):
-        """
-        Extract a single scenario ray and adapt radiological depths.
-
-        Parameters
-        ----------
-        ray (dict):
-            The ray data.
-        scen_idx (int):
-            The scenario index.
-
-        Returns
-        -------
-        dict:
-            The scenario ray with adapted radiological depths.
-        """
-        # Gets number of scenario
-        scen_num = self.mult_scen.scen_num(scen_idx)
-        ct_scen = self.mult_scen.linear_mask[0][scen_num]
-
-        # First, create a ray of the specific scenario to adapt rad depths
-        scen_ray = ray.copy()
-        scen_ray["rad_depths_gpu"] = scen_ray["rad_depths_gpu"][ct_scen]
-        scen_ray["rad_depths_gpu"] = (1 + self.mult_scen.rel_range_shift[scen_num]) * scen_ray[
-            "rad_depths_gpu"
-        ] + self.mult_scen.abs_range_shift[scen_num]
-        scen_ray["radial_dist_sq_gpu"] = scen_ray["radial_dist_sq_gpu"][ct_scen]
-        scen_ray["ix"] = scen_ray["ix"][ct_scen]
-
-        if self.mult_scen.abs_range_shift[scen_num] < 0:
-            # TODO: better way to handle this?
-            scen_ray["rad_depths_gpu"][scen_ray["rad_depths_gpu"] < 0] = 0
-
-        if "geo_depths" in scen_ray:
-            scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen]
-
-        if "lat_dists" in scen_ray:
-            scen_ray["lat_dists"] = scen_ray["lat_dists"][ct_scen]
-
-    
-
-        return scen_ray
+       return scen_ray, scen_ray_gpu
 
     def _get_ray_geometry_from_beam(self, ray: dict[str], beam_info: dict[str]):
         ray["effective_lateral_cut_off"] = beam_info.get(
@@ -1218,83 +1022,43 @@ class PencilBeamEngineAbstract(DoseEngineBase):
      def calc_geo_dists_gpu(
         rot_coords_bev, source_point_bev, target_point_bev, sad, lateral_cutoff,nb_rays,m,rot_coords_temp,subset_mask, rad_distances_sq, lat_dists
     ):
-        """
-         kernel which Calculate geometric distances for dose calculation.
-
-         Parameters
-         ----------
-         rot_coords_bev : Array
-             Coordinates in beam's eye view (BEV) of the voxels where ray tracing results are
-             available.
-         source_point_bev : Array
-             Source point in voxel coordinates in BEV.
-         target_point_bev : Array
-             Target point in voxel coordinates in BEV.
-         sad : float
-             Source-to-axis distance.
-         rad_depth_mask : Array
-             Masks the voxels for which radiological depth calculations are available.
-         lateral_cutoff : float
-             Lateral cutoff specifying the neighborhood for dose calculations.
-
-         Returns
-         -------
-         rad_distances_sq : Array
-             Squared radial distances to the central ray.
-         lat_dists : Array
-             Lateral distances to the central ray (in X & Z).
-         subset_mask:Array
-         
-        """
         i = cuda.grid(1)
         if i >= m: #nb operation
            return
         a0 = -source_point_bev[0]
         a1 = -source_point_bev[1]
         a2 = -source_point_bev[2]
-
         norm_a = math.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
-
         a0 /= norm_a
         a1 /= norm_a
         a2 /= norm_a
-
-
         bx = target_point_bev[0] - source_point_bev[0]
         by = target_point_bev[1] - source_point_bev[1]
         bz = target_point_bev[2] - source_point_bev[2]
-
         norm_b = math.sqrt(bx*bx + by*by + bz*bz)
         bx /= norm_b
         by /= norm_b
         bz /= norm_b
-
         cx = a1 * bz - a2 * by
         cy = a2 * bx - a0 * bz
         cz = a0 * by - a1 * bx
         cnorm=math.sqrt(cx * cx + cy * cy + cz * cz)
+        
+        ##################################################
         tolerance = 1e-7
         if abs(a0 - bx) < tolerance and abs(a1 - by) < tolerance and abs(a2 - bz) < tolerance:
-
-                      
-                      
-            
          rot_coords_temp[i,0]=rot_coords_bev[i][0]
          rot_coords_temp[i,1]=rot_coords_bev[i][1]
          rot_coords_temp[i,2]=rot_coords_bev[i][2]
         else:
-           
-
          cross=cuda.local.array((3,3), dtype=np.float32)
          ################################################## skew matrix cross product building
          cross[0, 0] = 0.0
          cross[0, 1] = -cz
          cross[0, 2] = cy
-
          cross[1, 0] = cz
          cross[1, 1] = 0.0
          cross[1, 2] = -cx
-
          cross[2, 0] = -cy
          cross[2, 1] = cx
          cross[2, 2] = 0.0
@@ -1304,12 +1068,9 @@ class PencilBeamEngineAbstract(DoseEngineBase):
          cross2[0, 0] = cross[0, 0] * cross[0, 0]+cross[0, 1] * cross[1, 0]+cross[0, 2] * cross[2, 0]
          cross2[0, 1] = cross[0, 0] * cross[0, 1]+cross[0, 1] * cross[1, 1]+cross[0, 2] * cross[2, 1]
          cross2[0, 2] = cross[0, 0] * cross[0, 2]+cross[0, 1] * cross[1, 2]+cross[0, 2] * cross[2, 2]
-
          cross2[1, 0] = cross[1, 0] * cross[0, 0]+cross[1, 1] * cross[1, 0]+cross[1, 2] * cross[2, 0]
          cross2[1, 1] = cross[1, 0] * cross[0, 1]+cross[1, 1] * cross[1, 1]+cross[1, 2] * cross[2, 1]
          cross2[1, 2] = cross[1, 0] * cross[0, 2]+cross[1, 1] * cross[1, 2]+cross[1, 2] * cross[2, 2]
-
-
          cross2[2, 0] = cross[2, 0] * cross[0, 0]+cross[2, 1] * cross[1, 0]+cross[2, 2] * cross[2, 0]
          cross2[2, 1] = cross[2, 0] * cross[0, 1]+cross[2, 1] * cross[1, 1]+cross[2, 2] * cross[2, 1]
          cross2[2, 2] = cross[2, 0] * cross[0, 2]+cross[2, 1] * cross[1, 2]+cross[2, 2] * cross[2, 2]
@@ -1321,39 +1082,21 @@ class PencilBeamEngineAbstract(DoseEngineBase):
          derived_rot_mat[0, 0] = 1.0 + cross[0, 0] + (cross2[0, 0] *offset/(cnorm))
          derived_rot_mat[0, 1] =  cross[0, 1] + (cross2[0, 1] * offset/(cnorm))
          derived_rot_mat[0, 2] =  cross[0, 2] + (cross2[0, 2] * offset/(cnorm))
-
          derived_rot_mat[1, 0] =  cross[1, 0] + (cross2[1, 0] * offset/(cnorm))
          derived_rot_mat[1, 1] = 1.0 + cross[1, 1] + (cross2[1, 1] * offset/(cnorm))
          derived_rot_mat[1, 2] =  cross[1, 2] + (cross2[1, 2] * offset/(cnorm))
-
          derived_rot_mat[2, 0] =  cross[2, 0] + (cross2[2, 0] * offset/(cnorm))
          derived_rot_mat[2, 1] =  cross[2, 1] + (cross2[2, 1] * offset/(cnorm))
          derived_rot_mat[2, 2] =  1.0 + cross[2, 2] + (cross2[2, 2] * offset/(cnorm))
          ##################################################
-        #add(identity,cross,cross2,off,cnorm*cnorm,derived_rot_mat)
-           
-         
-         for j in range(3):
-          val = 0
-          for k in range(3):
-            val += rot_coords_bev[i, k] * derived_rot_mat[k, j]
-          rot_coords_temp[i, j] = val
-         
-         """
          rot_coords_temp[i, 0] = rot_coords_bev[i, 0] * derived_rot_mat[0, 0]+rot_coords_bev[i, 1] * derived_rot_mat[1, 0]+rot_coords_bev[i, 2] * derived_rot_mat[2, 0]
          rot_coords_temp[i, 1] = rot_coords_bev[i, 0] * derived_rot_mat[0, 1]+rot_coords_bev[i, 1] * derived_rot_mat[1, 1]+rot_coords_bev[i, 2] * derived_rot_mat[2, 1]
          rot_coords_temp[i, 2] = rot_coords_bev[i, 0] * derived_rot_mat[0, 2]+rot_coords_bev[i, 1] * derived_rot_mat[1,2 ]+rot_coords_bev[i, 2] * derived_rot_mat[2, 2]
-         """
-
-
-
-
+        
+        ##################################################
         lat_dists[i,0]=rot_coords_temp[i,0]+source_point_bev[0]
         lat_dists[i,1]=rot_coords_temp[i,2]+source_point_bev[2]
-
-
         rad_distances_sq[i]=lat_dists[i,0]**2+lat_dists[i,1]**2
-
         subset_mask[i]=rad_distances_sq[i]<=(lateral_cutoff/sad)**2*rot_coords_temp[i,1]**2
 
     def calc_geo_dists(
