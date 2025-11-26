@@ -223,7 +223,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         start = time.perf_counter()
                         # Initialize Ray Geometry
                         if has_gpu:
-                         curr_ray, curr_ray_gpu = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device,beam_geo_depth,beam_rad_depths,ix_device) # 10.1 ms ± 1.23 ms
+                         curr_ray, curr_ray_gpu = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device,beam_geo_depth,beam_rad_depths,ix_device) # 7.75 ms ± 14.8 μs
                         else:
                          curr_ray = self._init_ray(curr_beam, j) # 59.1 ms ± 1.46 ms
 
@@ -251,13 +251,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                     for k in range(curr_ray["num_of_bixels"]):
                                         # Bixel Computation
                                         if has_gpu : 
-                                            curr_bixel = self._compute_bixel_gpu(scen_ray, scen_ray_gpu,k) # 5.08 ms ± 65.7 μs
-                                        else :
-                                            curr_bixel = self._compute_bixel(scen_ray, k) # 6.87 ms ± 28 μs
-
-                                        # fill the current bixel in the sparse dose influence
-                                        # matrix
-                                        if has_gpu : 
+                                            curr_bixel = self._compute_bixel_gpu(scen_ray, scen_ray_gpu,k) # 3.53 ms ± 106 μs
                                             self._fill_dij_gpu(
                                                 curr_bixel,
                                                 dij,
@@ -268,7 +262,9 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                                 k,
                                                 bixel_counter + k,
                                             )
-                                        else:
+                                        else :
+                                            # print('pas censé passer par la')
+                                            curr_bixel = self._compute_bixel(scen_ray, k) # 6.87 ms ± 28 μs
                                             self._fill_dij(
                                                 curr_bixel,
                                                 dij,
@@ -279,8 +275,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                                 k,
                                                 bixel_counter + k,
                                             )
-
-                                        
+                                                                            
                         # Progress Update & Bookkeeping
                         bixel_counter += curr_ray["num_of_bixels"]
                         bixel_beam_counter += curr_ray["num_of_bixels"]
@@ -585,15 +580,19 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         radial_dist_sq_device = cp.take(radial_dist_sq_device, idx) # 55.3 μs ± 711 ns
         lat_dists_device = cp.take(lat_dists_device, idx, axis=0) # 112 μs ± 7.05 μs
         ix_device[beam_valid_coords_all_device] = subset_mask_device # 510 μs ± 83.3 μs
-        # # SOUS_TOT_BLOCK = 1.0 ms (1038 μs)
+
+        ray_valid_coords_device = ix_device & beam_valid_coords_device # 77.2 μs ± 628 ns
+        ray_idx = cp.where(ray_valid_coords_device)[0] # 281 μs ± 548 ns
+        ray_ix_device = vdose_grid_device[ray_idx] # 79.4 μs ± 307 ns
+        ix_idx = cp.where(ix_device)[0] # 281 μs ± 479 ns
+        local_mask = ray_valid_coords_device[ix_idx] # 49.2 μs ± 1.38 μs
+        ray_radial_dist_sq_device = radial_dist_sq_device[local_mask] # 296 μs ± 3.27 μs
+        ray_lat_dists_device = cp.take(lat_dists_device, ray_idx, axis=0) # 105 μs ± 1.69 μs
+        ray_geo_depths_device = beam_geo_depth[ray_idx] # 79.2 μs ± 286 ns 
+        ray_rad_depths_device = beam_rad_depths[ray_idx] # 55.9 μs ± 308 ns
+        ray_valid_coords_all_device = cp.any(ray_valid_coords_device) # 61.1 μs ± 871 ns
         
-        ray_valid_coords_device = ix_device & beam_valid_coords_device # 98.8 μs ± 6.98 μs
-        ray_ix_device = vdose_grid_device[ray_valid_coords_device] # 502 μs ± 83.6 μs
-        ray_radial_dist_sq_device = radial_dist_sq_device[ray_valid_coords_device[ix_device]] # 734 μs ± 60.2 μs
-        ray_lat_dists_device = lat_dists_device[ray_valid_coords_device[ix_device]] # 965 μs ± 66.2 μs
-        ray_valid_coords_all_device = cp.asarray([cp.any(ray_valid_coords_device)]) # 150 μs ± 1.45 μs
-        ray_geo_depths_device = beam_geo_depth[ray_valid_coords_device] # 493 μs ± 81.7 μs
-        ray_rad_depths_device = beam_rad_depths[ray_valid_coords_device] # 427 μs ± 14.3 μs
+        
         ray_gpu = {"valid_coords": [ray_valid_coords_device],
                    "ix": [ray_ix_device],
                    "radial_dist_sq": [ray_radial_dist_sq_device],
@@ -602,9 +601,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                    "geo_depths": [ray_geo_depths_device],
                    "rad_depths": [ray_rad_depths_device],
                    } # 192 ns ± 1.96 ns
-        # SOUS_TOT_BLOCK = 3.3 ms (3370 μs)
-        # SOUS_TOT_BLOCK = 4.7 ms (4653 μs)
-        # TOTAL_SECTION = 9.1 ms (9061 μs)
+        
         
         ray["sigma_ini"] = self._calc_sigma_ini_on_ray(ray) # 67.8 μs ± 458 ns
         if self.air_offset_correction:

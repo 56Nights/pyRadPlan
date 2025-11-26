@@ -16,11 +16,11 @@ class ParticleHongPencilBeamEngine(ParticlePencilBeamEngineAbstract):
     # private methods
     def _calc_particle_bixel(self, bixel):
         kernels = self._interpolate_kernels_in_depth(bixel)
-
+        # print('plus censé passer par la')
         pb_kernel = cast(ParticlePencilBeamKernel, bixel["kernel"])
 
         xp = array_api_compat.array_namespace(bixel["radial_dist_sq"])
-
+        # print('doit pas etre la')
         # Lateral Component
         if self.lateral_model == "single":
             # Compute lateral sigma
@@ -86,15 +86,12 @@ class ParticleHongPencilBeamEngine(ParticlePencilBeamEngineAbstract):
             # Multiple with dose
             bixel["alpha_dose"] = bixel["physical_dose"] * bixel_alpha
             bixel["sqrt_beta_dose"] = bixel["physical_dose"] * xp.sqrt(bixel_beta)
-    
+            
     # private methods
     def _calc_particle_bixel_gpu(self, bixel, bixel_gpu):
         kernels = self._interpolate_kernels_in_depth_gpu(bixel, bixel_gpu)
-
         pb_kernel = cast(ParticlePencilBeamKernel, bixel["kernel"])
-
-        # xp = array_api_compat.array_namespace(bixel["radial_dist_sq"])
-
+        # print('ok passer par la')
         # Lateral Component
         if self.lateral_model == "single":
             # Compute lateral sigma
@@ -142,21 +139,16 @@ class ParticleHongPencilBeamEngine(ParticlePencilBeamEngineAbstract):
 
         else:
             raise ValueError("Invalid Lateral Model")
-
         bixel["physical_dose"] = pb_kernel.lateral_cut_off.comp_fac * lateral * kernels["idd"]
-
         # Check if we have valid dose values
         if cp.any(cp.isnan(bixel["physical_dose"])) or cp.any(bixel["physical_dose"] < 0):
             raise ValueError("Error in particle dose calculation.")
-
         if self.calc_let:
             bixel["let_dose"] = bixel["physical_dose"] * kernels["let"]
-
         if self.calc_bio_dose:
             # TODO: correct / adaptive alpha / beta values given tissue indices
             bixel_alpha = kernels["alpha"][0]
             bixel_beta = kernels["beta"][0]
-
             # Multiple with dose
             bixel["alpha_dose"] = bixel["physical_dose"] * bixel_alpha
             bixel["sqrt_beta_dose"] = bixel["physical_dose"] * cp.sqrt(bixel_beta)
