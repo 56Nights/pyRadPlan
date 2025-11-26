@@ -183,25 +183,23 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
             cutoff_info = kernel.lateral_cut_off # 24.3 ns ± 0.475 ns
             
             if cutoff_info.cut_off.size > 1:
-                curr_rad_depths_gpu = curr_ray_gpu["rad_depths"] # 
+                curr_rad_depths_gpu = curr_ray_gpu["rad_depths"] # 27.8 ns ± 0.297 ns
                 cutoff_depths_gpu   = cp.asarray(cutoff_info.depths) # 65.4 μs ± 292 ns
                 cutoff_sq_gpu       = cp.asarray(cutoff_info.cut_off**2) # 71.3 μs ± 222 ns
-                radial_dist_sq_gpu  = curr_ray_gpu["radial_dist_sq"] # 
+                radial_dist_sq_gpu  = curr_ray_gpu["radial_dist_sq"] # 27.7 ns ± 1.06 ns
                 kernel_last_depth   = cp.asarray(kernel.depths[-1]) # 45.9 μs ± 1.04 μs
                 tmp_offset_gpu      = cp.asarray(tmp_offset) # 38.3 μs ± 40.8 ns
-                
                 interp_vals = cp.interp(
                 curr_rad_depths_gpu,
                 cutoff_depths_gpu + tmp_offset_gpu,
                 cutoff_sq_gpu,
                 left=cp.nan,
                 right=cp.nan,
-                ) # 
-                
+                ) # 344 μs ± 7.29 μs
                 curr_ix_gpu = (
                 (interp_vals >= radial_dist_sq_gpu)
                 & (curr_rad_depths_gpu <= kernel_last_depth + tmp_offset_gpu)
-                ) # 
+                ) # 102 μs ± 6.86 μs
             else:
                 curr_ix_gpu = (cutoff_info.cut_off[0] ** 2 >= curr_ray_gpu["radial_dist_sq"]) & (
                     curr_ray_gpu["rad_depths"] <= kernel.depths[-1] + tmp_offset
@@ -209,33 +207,43 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         else:
             raise ValueError("dosimetric_lateral_cutoff must be a value > 0 and <= 1!")
 ###############################################################################
-        # curr_ix = cp.asnumpy(curr_ix_gpu)
-        # partie a passer GPU :    
-        # bixel["sub_ix"] = curr_ix # 32.7 ns ± 1.4 ns
-        # bixel["ix"] = curr_ray["ix"][curr_ix] # 108 μs ± 1.45 μs
-        # bixel["radial_dist_sq"] = curr_ray["radial_dist_sq"][bixel["sub_ix"]] # 101 μs ± 1.48 μs
-        # bixel["rad_depths"] = curr_ray["rad_depths"][bixel["sub_ix"]] # 108 μs ± 1.99 μs
-        # if "lat_dists" in curr_ray:
-        #     bixel["lat_dists"] = curr_ray["lat_dists"][bixel["sub_ix"]] # 828 μs ± 14.5 μs
-            
         # version GPU : 
-        bixel_sub_ix_gpu = curr_ix_gpu
-        bixel_ix_gpu = curr_ray_gpu["ix"][curr_ix_gpu]
-        bixel_radial_dist_sq_gpu = curr_ray_gpu["radial_dist_sq"][bixel_sub_ix_gpu] # 
-        bixel_rad_depth_gpu = curr_ray_gpu["rad_depths"][bixel_sub_ix_gpu] # 
-        if "lat_dists" in curr_ray_gpu:
-            bixel_lat_dists_gpu = curr_ray_gpu["lat_dists"][bixel_sub_ix_gpu] # 
-            bixel["lat_dists"] = cp.asnumpy(bixel_lat_dists_gpu)
             
-        bixel["sub_ix"] =cp.asnumpy(bixel_sub_ix_gpu)
-        bixel["ix"] = cp.asnumpy(bixel_ix_gpu)
-        bixel["radial_dist_sq"] =cp.asnumpy(bixel_radial_dist_sq_gpu)
-        bixel["rad_depths"] =cp.asnumpy(bixel_rad_depth_gpu)
+        # bixel_ix_gpu = curr_ray_gpu["ix"][curr_ix_gpu] # 316 μs ± 1.75 μs
+        # bixel_radial_dist_sq_gpu = curr_ray_gpu["radial_dist_sq"][curr_ix_gpu] # 315 μs ± 999 ns
+        # bixel_rad_depth_gpu = curr_ray_gpu["rad_depths"][curr_ix_gpu] # 312 μs ± 3.34 μs
+        
+        idx_gpu = cp.where(curr_ix_gpu)[0] # 245 μs ± 4.27 μs
+        bixel_ix_gpu             = curr_ray_gpu["ix"].take(idx_gpu) # 46.5 μs ± 1.43 μs
+        bixel_radial_dist_sq_gpu = curr_ray_gpu["radial_dist_sq"].take(idx_gpu) # 45.2 μs ± 1.18 μs
+        bixel_rad_depth_gpu      = curr_ray_gpu["rad_depths"].take(idx_gpu) # 46.1 μs ± 1.3 μs
+        
+        if "lat_dists" in curr_ray_gpu:
+            #bixel_lat_dists_gpu = curr_ray_gpu["lat_dists"].take(idx_gpu) # 50.1 μs ± 467 ns
+            #bixel["lat_dists"] = cp.asnumpy(bixel_lat_dists_gpu) # 107 μs ± 544 ns
+            bixel_gpu ={"sub_ix" : curr_ix_gpu,
+                        "ix" : bixel_ix_gpu,
+                        "radial_dist_sq":bixel_radial_dist_sq_gpu,
+                        "rad_depths":bixel_rad_depth_gpu,
+                        }
+        else:
+            bixel_gpu ={"sub_ix" : curr_ix_gpu,
+                        "ix" : bixel_ix_gpu,
+                        "radial_dist_sq":bixel_radial_dist_sq_gpu,
+                        "rad_depths":bixel_rad_depth_gpu,
+                        }
+            
+            
+        #bixel["sub_ix"] =cp.asnumpy(curr_ix_gpu) # 134 μs ± 740 ns
+        bixel["ix"] = cp.asnumpy(bixel_ix_gpu) # 110 μs ± 3.29 μs
+        #bixel["radial_dist_sq"] =cp.asnumpy(bixel_radial_dist_sq_gpu) # 69.3 μs ± 187 ns
+        #bixel["rad_depths"] =cp.asnumpy(bixel_rad_depth_gpu) # 69.4 μs ± 214 ns
+                
+        
+        
 ###############################################################################        
         # Compute Bixel
-        self._calc_particle_bixel_gpu(bixel,bixel_radial_dist_sq_gpu) # 
-        #self._calc_particle_bixel(bixel) # 
-
+        self._calc_particle_bixel_gpu(bixel,bixel_gpu) # 1.77 ms ± 68.3 μs
         
         return bixel
 
@@ -370,6 +378,66 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         kernel_interp = array_interp(bixel["rad_depths"], depths, used_kernels)
 
         return kernel_interp
+
+    def _interpolate_kernels_in_depth_gpu(self, bixel, bixel_gpu):
+        kernel = cast(ParticlePencilBeamKernel, bixel["kernel"]) # 68 ns ± 2.07 ns
+        depths = kernel.depths # 23.9 ns ± 0.191 ns
+        # Add potential offset
+        depths = depths + kernel.offset - bixel["rad_depth_offset"] # 2.02 μs ± 14.7 ns
+
+        # Conversion factor from MeV cm^2/g per primary to Gy mm^2 per 1e6 primaries
+        conversion_factor = 1.6021766208e-02 # 14.5 ns ± 0.716 ns
+
+        # Find all values we need to interpolate
+        used_kernels = {} # 25.1 ns ± 0.747 ns
+        used_kernels["idd"] = conversion_factor * kernel.idd # 1 μs ± 11 ns per loop
+
+        # Lateral Kernel Model
+        if self.lateral_model == "single":
+            used_kernels["sigma"] = kernel.sigma
+        elif self.lateral_model == "singleXY":
+            used_kernels["sigma_x"] = kernel.sigma_x
+            used_kernels["sigma_y"] = kernel.sigma_y
+        elif self.lateral_model == "double":
+            used_kernels["sigma_1"] = kernel.sigma_1 # 39.1 ns ± 1.03 ns
+            used_kernels["sigma_2"] = kernel.sigma_2 # 38.8 ns ± 1.42 ns
+            used_kernels["weight"] = kernel.weight # 40.9 ns ± 1.1 ns
+        elif self.lateral_model == "multi":
+            used_kernels["weight_multi"] = kernel.weight_multi
+            used_kernels["sigma_multi"] = kernel.sigma_multi
+        else:
+            raise ValueError("Invalid Lateral Model")
+
+        # LET
+        if self.calc_let:
+            used_kernels["let"] = kernel.let
+
+        # bioDose
+        # TODO:
+        if self.calc_bio_dose:
+            used_kernels["alpha"] = kernel.alpha
+            used_kernels["beta"] = kernel.beta
+
+        # Interpolate all fields in X
+        # kernel_interp = array_interp(bixel["rad_depths"], depths, used_kernels) # 1.07 ms ± 7.38 μs
+        
+        # Version GPU
+        depths_gpu = cp.asarray(depths) # 70.1 μs ± 1.1 μs
+        fields = ["sigma_1", "sigma_2", "weight", "idd"] # 42 ns ± 1.16 ns
+        used_kernels_gpu = {field: cp.asarray(used_kernels[field]) for field in fields} # 274 μs ± 3.43 μs
+        rad_depths_gpu = bixel_gpu["rad_depths"] # 74.4 μs ± 200 ns
+        interp_kernels = {} # 26 ns ± 0.518 ns
+        
+        for field in fields:
+            interp_kernels[field] = cp.interp(
+                rad_depths_gpu,        # profondeur cible (sur GPU)
+                depths_gpu,            # profondeur originale (sur GPU)
+                used_kernels_gpu[field]   # valeurs originales (sur GPU)
+            ) # 474 μs ± 6.81 μs
+        kernel_interp = interp_kernels
+            
+        return kernel_interp
+
 
     def _get_ray_geometry_from_beam(self, ray: dict[str], beam_info: dict[str]):
         lateral_ray_cutoff = self._get_lateral_distance_from_dose_cutoff_on_ray(ray)

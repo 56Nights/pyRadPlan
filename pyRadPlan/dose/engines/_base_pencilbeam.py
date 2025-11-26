@@ -223,7 +223,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                         start = time.perf_counter()
                         # Initialize Ray Geometry
                         if has_gpu:
-                         curr_ray, curr_ray_gpu = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device,beam_geo_depth,beam_rad_depths,ix_device) # 
+                         curr_ray, curr_ray_gpu = self._init_ray_gpu(curr_beam, j,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device,beam_geo_depth,beam_rad_depths,ix_device) # 10.1 ms ± 1.23 ms
                         else:
                          curr_ray = self._init_ray(curr_beam, j) # 59.1 ms ± 1.46 ms
 
@@ -244,31 +244,43 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                                 if self.mult_scen.scen_mask[full_scen_idx]:
                                     # Extract single scenario ray
                                     if has_gpu :
-                                        scen_ray ,scen_ray_gpu = self._extract_single_scenario_ray_gpu(curr_ray,curr_ray_gpu, full_scen_idx) # 
+                                        scen_ray ,scen_ray_gpu = self._extract_single_scenario_ray_gpu(curr_ray,curr_ray_gpu, full_scen_idx) # 142 μs ± 1.09 μs
                                         # print('calculate single scen gpu')
                                     else :
                                         scen_ray = self._extract_single_scenario_ray(curr_ray, full_scen_idx) # 1.46 ms ± 4.84 μs
                                     for k in range(curr_ray["num_of_bixels"]):
                                         # Bixel Computation
                                         if has_gpu : 
-                                            curr_bixel = self._compute_bixel_gpu(scen_ray, scen_ray_gpu,k) #
+                                            curr_bixel = self._compute_bixel_gpu(scen_ray, scen_ray_gpu,k) # 5.08 ms ± 65.7 μs
                                         else :
                                             curr_bixel = self._compute_bixel(scen_ray, k) # 6.87 ms ± 28 μs
 
                                         # fill the current bixel in the sparse dose influence
                                         # matrix
-                                        
-                                        self._fill_dij(
-                                            curr_bixel,
-                                            dij,
-                                            scen_stf,
-                                            full_scen_idx,
-                                            i,
-                                            j,
-                                            k,
-                                            bixel_counter + k,
-                                        )
+                                        if has_gpu : 
+                                            self._fill_dij_gpu(
+                                                curr_bixel,
+                                                dij,
+                                                scen_stf,
+                                                full_scen_idx,
+                                                i,
+                                                j,
+                                                k,
+                                                bixel_counter + k,
+                                            )
+                                        else:
+                                            self._fill_dij(
+                                                curr_bixel,
+                                                dij,
+                                                scen_stf,
+                                                full_scen_idx,
+                                                i,
+                                                j,
+                                                k,
+                                                bixel_counter + k,
+                                            )
 
+                                        
                         # Progress Update & Bookkeeping
                         bixel_counter += curr_ray["num_of_bixels"]
                         bixel_beam_counter += curr_ray["num_of_bixels"]
@@ -532,47 +544,19 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         return ray
     
     def _init_ray_gpu(self, beam_info: dict[str], j: int,bev_coords,source_point_bev,rot_coords_temp,target_point_bev,m,beam_valid_coords_device,beam_valid_coords_all_device,vdose_grid_device, beam_geo_depth, beam_rad_depths,ix_device) -> dict[str]:
-        """
-        Initialize a ray for pencil beam dose calculation.
-
-        Parameters
-        ----------
-        curr_beam : dict
-            The current beam data.
-        j : int
-            The ray index.
-        bev_coords:
-        source_point_bev:Array
-            the 3D coordinate of the source point of the ray
-        rot_coords_temp:Array
-            temporary variable to hold the rotation matrix used in calc_geo_dists_gpu
-        target_point_bev:Array
-            the 3D coordinate of the target point of the ray
-
-        Returns
-        -------
-        dict
-            The initialized ray.
-        """
 
         ray = beam_info["beam"]["rays"][j] # 49.1 ns ± 0.599 ns
         ray["beam_index"] = beam_info["beam_index"] # 43.1 ns ± 0.54 ns
         ray["ray_index"] = j # 34.2 ns ± 1.02 ns
         ray["iso_center"] = beam_info["beam"]["iso_center"] # 56.2 ns ± 2.17 ns
-
         if "num_of_bixels_per_ray" in beam_info["beam"]:
             ray["num_of_bixels"] = beam_info["beam"]["num_of_bixels_per_ray"][j] # 108 ns ± 2.52 ns
         else:
-            # Fallback: use the actual number of beamlets on this ray
-            # This is needed for machines like "Focused" that don't precompute counts.
             ray["num_of_bixels"] = len(ray.get("beamlets", [])) or 0
-
         ray["source_point_bev"] = beam_info["beam"]["source_point_bev"] # 54.6 ns ± 0.952 ns
         ray["sad"] = beam_info["beam"]["sad"] # 54.2 ns ± 1.85 ns
         ray["bixel_width"] = beam_info["beam"]["bixel_width"] # 54.1 ns ± 1.79 ns
         ray["effective_lateral_cut_off"] = beam_info.get("effective_lateral_cut_off", self._effective_lateral_cutoff) # 65.4 ns ± 0.258 ns 
-        rad_depth_ix= beam_info["valid_coords_all"] # 28.3 ns ± 1.17 ns
-
 
         threads_per_block = 256 # 15.7 ns ± 0.772 ns
         blocks_per_grid = (m+threads_per_block-1)//threads_per_block # 72.7 ns ± 2.32 ns
@@ -580,7 +564,7 @@ class PencilBeamEngineAbstract(DoseEngineBase):
         lat_dists_device=cp.empty((m,2),dtype=cp.float32) # 4.01 μs ± 25.7 ns
         subset_mask_device=cp.empty((m),dtype=cp.int32) # 4.05 μs ± 40.7 ns
 
-        #cuda.synchronize() # 
+        # cuda.synchronize() # 
         nb_rays=beam_info["beam"]["num_of_rays"] # 39.5 ns ± 1.36 ns
         self.calc_geo_dists_gpu[blocks_per_grid, threads_per_block](
         bev_coords,
@@ -944,6 +928,66 @@ class PencilBeamEngineAbstract(DoseEngineBase):
                     data_dict["indices"][start:end] = bixel["ix"]
                     data_dict["nnz"] += ix_size
 
+        # Bookkeeping of bixel numbers
+        # remember beam and bixel number
+        if self._calc_dose_direct:
+            dij["beam_num"][curr_beam_idx] = curr_beam_idx
+            dij["ray_num"][curr_beam_idx] = curr_beam_idx
+            dij["bixel_num"][curr_beam_idx] = curr_beam_idx
+        else:
+            dij["beam_num"][bixel_counter] = curr_beam_idx
+            dij["ray_num"][bixel_counter] = curr_ray_idx
+            dij["bixel_num"][bixel_counter] = curr_bixel_idx
+            
+    def _fill_dij_gpu(
+        self,
+        bixel: dict,
+        dij: dict,
+        _stf: SteeringInformation,
+        scen_idx: int,
+        curr_beam_idx: int,
+        curr_ray_idx: int,
+        curr_bixel_idx: int,
+        bixel_counter: int,
+    ):
+        bixel["physical_dose"] = bixel["physical_dose"].get()
+        ix_size = 0
+        if bixel and "ix" in bixel:
+            ix_val = bixel["ix"]
+            try:
+                ix_size = ix_val.size
+            except AttributeError:
+                ix_size = len(ix_val)
+        sub_scen_idx = tuple(np.unravel_index(scen_idx, self.mult_scen.scen_mask.shape))
+        for q_name in self._computed_quantities:
+            if self._calc_dose_direct:
+                if ix_size > 0:
+                    dij[q_name][sub_scen_idx][bixel["ix"], curr_beam_idx] += (
+                        bixel["weight"] * bixel[q_name]
+                    )
+            else:
+                data_dict = dij[q_name][sub_scen_idx]
+                # Advance column pointer even when ix_size == 0 to keep CSC valid
+                start = data_dict["indptr"][bixel_counter]
+                end = start + ix_size
+                data_dict["indptr"][bixel_counter + 1] = end
+    
+                if ix_size > 0:
+                    need_nnz = data_dict["nnz"] + ix_size
+                    if data_dict["data"].size < need_nnz:
+                        logger.debug("Resizing data and indices arrays for %s...", q_name)
+                        grow = max(
+                            ix_size, (self._num_of_columns_dij - bixel_counter) * (ix_size + 1)
+                        )
+                        new_size = data_dict["data"].size + grow
+                        data_dict["data"].resize((new_size,), refcheck=False)
+                        data_dict["indices"].resize((new_size,), refcheck=False)
+    
+                    # Fill values and indices into the allocated slice
+                    data_dict["data"][start:end] = bixel[q_name]
+                    data_dict["indices"][start:end] = bixel["ix"]
+                    data_dict["nnz"] += ix_size
+    
         # Bookkeeping of bixel numbers
         # remember beam and bixel number
         if self._calc_dose_direct:
