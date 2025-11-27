@@ -25,9 +25,11 @@ from ...core.xp_utils.compat import interp1d as array_interp
 
 logger = logging.getLogger(__name__)
 
-has_gpu=True
+"""
+has_gpu=False
 if has_gpu:
-    import cupy as cp
+    import cupy as self.cp
+"""
 
 class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
     """
@@ -147,7 +149,6 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
     
     def _compute_bixel_gpu(self, curr_ray: dict, curr_ray_gpu, k: int) -> dict:
         # bixel = self._init_bixel(curr_ray, k) # 4.87 ms ± 30.9 μs
-        
         bixel = curr_ray["beamlets"][k] # 35.8 ns ± 0.764 ns
         bixel["beam_index"] = curr_ray["beam_index"] # 45.8 ns ± 0.884 ns
         bixel["ray_index"] = curr_ray["ray_index"] # 46.1 ns ± 1.04 ns
@@ -185,17 +186,17 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
             
             if cutoff_info.cut_off.size > 1:
                 curr_rad_depths_gpu = curr_ray_gpu["rad_depths"] # 27.8 ns ± 0.297 ns
-                cutoff_depths_gpu   = cp.asarray(cutoff_info.depths) # 65.4 μs ± 292 ns
-                cutoff_sq_gpu       = cp.asarray(cutoff_info.cut_off**2) # 71.3 μs ± 222 ns
+                cutoff_depths_gpu   = self.cp.asarray(cutoff_info.depths) # 65.4 μs ± 292 ns
+                cutoff_sq_gpu       = self.cp.asarray(cutoff_info.cut_off**2) # 71.3 μs ± 222 ns
                 radial_dist_sq_gpu  = curr_ray_gpu["radial_dist_sq"] # 27.7 ns ± 1.06 ns
-                kernel_last_depth   = cp.asarray(kernel.depths[-1]) # 45.9 μs ± 1.04 μs
-                tmp_offset_gpu      = cp.asarray(tmp_offset) # 38.3 μs ± 40.8 ns
-                interp_vals = cp.interp(
+                kernel_last_depth   = self.cp.asarray(kernel.depths[-1]) # 45.9 μs ± 1.04 μs
+                tmp_offset_gpu      = self.cp.asarray(tmp_offset) # 38.3 μs ± 40.8 ns
+                interp_vals = self.cp.interp(
                 curr_rad_depths_gpu,
                 cutoff_depths_gpu + tmp_offset_gpu,
                 cutoff_sq_gpu,
-                left=cp.nan,
-                right=cp.nan,
+                left=self.cp.nan,
+                right=self.cp.nan,
                 ) # 344 μs ± 7.29 μs
                 curr_ix_gpu = (
                 (interp_vals >= radial_dist_sq_gpu)
@@ -210,7 +211,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
 ###############################################################################
         # version GPU : 
                    
-        idx_gpu = cp.where(curr_ix_gpu)[0] # 245 μs ± 4.27 μs
+        idx_gpu = self.cp.where(curr_ix_gpu)[0] # 245 μs ± 4.27 μs
         bixel_ix_gpu             = curr_ray_gpu["ix"].take(idx_gpu) # 46.5 μs ± 1.43 μs
         bixel_radial_dist_sq_gpu = curr_ray_gpu["radial_dist_sq"].take(idx_gpu) # 45.2 μs ± 1.18 μs
         bixel_rad_depth_gpu      = curr_ray_gpu["rad_depths"].take(idx_gpu) # 46.1 μs ± 1.3 μs
@@ -230,7 +231,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
                         "rad_depths": bixel_rad_depth_gpu,
                         }
             
-        bixel["ix"] = cp.asnumpy(bixel_ix_gpu) # 110 μs ± 3.29 μs
+        bixel["ix"] = self.cp.asnumpy(bixel_ix_gpu) # 110 μs ± 3.29 μs
                 
 ###############################################################################        
         # Compute Bixel
@@ -413,33 +414,13 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         # kernel_interp = array_interp(bixel["rad_depths"], depths, used_kernels) # 1.07 ms ± 7.38 μs
                 
         # Version GPU
-        # depths_gpu = cp.asarray(depths) # 70.1 μs ± 1.1 μs        
-        # fields = list(used_kernels.keys()) #108 ns ± 4.09 ns
-        # used_kernels_gpu = {field: cp.asarray(used_kernels[field]) for field in fields} # 274 μs ± 3.43 μs
-        # interp_kernels = {} # 26 ns ± 0.518 ns
+        depths_gpu = self.cp.asarray(depths) # 70.1 μs ± 1.1 μs        
+        fields = list(used_kernels.keys()) #108 ns ± 4.09 ns
+        used_kernels_gpu = {field: self.cp.asarray(used_kernels[field]) for field in fields} # 274 μs ± 3.43 μs
+        interp_kernels = {} # 26 ns ± 0.518 ns
         
-        # interp_kernels = {field: cp.interp(bixel_gpu["rad_depths"], depths_gpu,used_kernels_gpu[field])for field in fields} # 467 μs ± 3.67 μs
-        
-        # interp_kernels = {}
-        interp_kernels = self.interp_gpu(bixel_gpu, depths, used_kernels)
-        
-        return interp_kernels
-
-    def interp_gpu(self, bixel, depths, used_kernels, _cache={}):
-        depths_key = id(depths)  # identifiant unique tant que depths ne change pas
-        if depths_key not in _cache:
-            _cache[depths_key] = cp.asarray(depths)
-        depths_gpu = _cache[depths_key]
-        kernels_key = id(used_kernels)  # change uniquement si le dict est remplacé
-        if kernels_key not in _cache:
-            _cache[kernels_key] = {f: cp.asarray(used_kernels[f]) 
-                                   for f in used_kernels}
-        used_kernels_gpu = _cache[kernels_key]
-        fields = used_kernels.keys()
-        interp_kernels = {
-            f: cp.interp(bixel["rad_depths"], depths_gpu, used_kernels_gpu[f])
-            for f in fields
-        }
+        interp_kernels = {field: self.cp.interp(bixel_gpu["rad_depths"], depths_gpu,used_kernels_gpu[field])for field in fields} # 467 μs ± 3.67 μs
+               
         return interp_kernels
 
 
@@ -611,7 +592,8 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         dict
             Updated Beam Information dictionary.
         """
-        beam_info = super()._init_beam(dij, ct, cst, stf, i)
+        beam_info = super()._init_beam_gpu(dij, ct, cst, stf, i)
+
         # Sanity Check
         assert isinstance(self._machine, ParticleAccelerator)
 
