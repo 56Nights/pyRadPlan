@@ -25,11 +25,7 @@ from ...core.xp_utils.compat import interp1d as array_interp
 
 logger = logging.getLogger(__name__)
 
-"""
-has_gpu=False
-if has_gpu:
-    import cupy as self.cp
-"""
+
 
 class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
     """
@@ -149,7 +145,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
     
     def _compute_bixel_gpu(self, curr_ray: dict, curr_ray_gpu, k: int) -> dict:
         # bixel = self._init_bixel(curr_ray, k) # 4.87 ms ± 30.9 μs
-        bixel = curr_ray["beamlets"][k] # 35.8 ns ± 0.764 ns
+        bixel = curr_ray["beamlets"][k].copy() # 35.8 ns ± 0.764 ns
         bixel["beam_index"] = curr_ray["beam_index"] # 45.8 ns ± 0.884 ns
         bixel["ray_index"] = curr_ray["ray_index"] # 46.1 ns ± 1.04 ns
         bixel["bixel_index"] = k # 32.2 ns ± 1.08 ns
@@ -258,7 +254,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
             The initialized bixel.
         """
 
-        bixel = curr_ray["beamlets"][k]
+        bixel = curr_ray["beamlets"][k].copy()
         bixel["beam_index"] = curr_ray["beam_index"]
         bixel["ray_index"] = curr_ray["ray_index"]
         bixel["bixel_index"] = k
@@ -592,7 +588,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         dict
             Updated Beam Information dictionary.
         """
-        beam_info = super()._init_beam_gpu(dij, ct, cst, stf, i)
+        beam_info = super()._init_beam(dij, ct, cst, stf, i)
 
         # Sanity Check
         assert isinstance(self._machine, ParticleAccelerator)

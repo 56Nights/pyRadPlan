@@ -43,7 +43,15 @@ ct, cst = load_tg119()
 # Create a plan object
 pln = IonPlan(radiation_mode="protons", machine="Generic")
 pln.prop_opt = {"solver": "scipy"}
-pln.prop_dose_calc = {"dose_grid": ct.grid}
+pln.prop_stf = {
+    "energy": 200,  # set VHEE energy at [100, 150, 200] MeV
+    "bixel_width": 40.0,
+     "gantry_angles": [0, 72, 144,216],
+     "couch_angles": [0, 0, 0,0],
+    #"gantry_angles": [0],
+    #"couch_angles": [0],
+}
+pln.prop_dose_calc = {"dose_grid": {"resolution": [1.0, 1.0, 1.0]}}
 
 # Generate Steering Geometry ("stf")
 stf = generate_stf(ct, cst, pln)

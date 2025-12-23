@@ -3,11 +3,7 @@ import array_api_compat
 from ._base_pencilbeam_particle import ParticlePencilBeamEngineAbstract
 from ...machines import ParticlePencilBeamKernel
 import math
-"""
-has_gpu=False
-if has_gpu:
-    import cupy as self.cp
-"""
+
 
 class ParticleHongPencilBeamEngine(ParticlePencilBeamEngineAbstract):
     # constants
@@ -177,7 +173,7 @@ class ParticleHongPencilBeamEngine(ParticlePencilBeamEngineAbstract):
         if self.cp.any(self.cp.isnan(bixel["physical_dose"])) or self.cp.any(bixel["physical_dose"] < 0):
             raise ValueError("Error in particle dose calculation.")
         if self.calc_let:
-            bixel["let_dose"] = bixel["physical_dose"] * kernels["let"]
+            bixel["let_dose"] = (bixel["physical_dose"] * kernels["let"]).get()
         if self.calc_bio_dose:
             # TODO: correct / adaptive alpha / beta values given tissue indices
             bixel_alpha = kernels["alpha"][0]

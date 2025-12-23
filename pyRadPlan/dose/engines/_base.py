@@ -274,7 +274,8 @@ class DoseEngineBase(ABC):
         dij = self._calc_dose(ct, cst, stf)
         time_elapsed = time.time() - time_start
         logger.info("Dose influence matrix calculation done in %.2f seconds.", time_elapsed)
-
+        with open("benchmark_results.txt", "a") as file:
+         file.write(f"{time_elapsed}"+"\n ")
         return dij
 
     def set_overlap_priorities(self, cst: StructureSet, ct_dim=None) -> StructureSet:
@@ -597,6 +598,7 @@ class DoseEngineBase(ABC):
         return dij
 
     def _finalize_dose(self, dij: dict) -> Dij:
+
         return validate_dij(dij)
 
     def _progress_update(self, pos, total):

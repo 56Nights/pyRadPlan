@@ -13,7 +13,7 @@ from pyRadPlan.geometry import lps
 from pyRadPlan.stf._beam import Beam
 
 from ._perf import fast_spatial_circle_lookup
-
+from numba import cuda
 logger = logging.getLogger(__name__)
 
 
@@ -159,7 +159,7 @@ class RayTracerBase(ABC):
         rot_mat = lps.get_beam_rotation_matrix(beam.gantry_angle, beam.couch_angle)
 
         # rotate coordinates
-        coords = (self._coords - beam.iso_center) @ rot_mat - beam.source_point_bev
+        coords = (self._coords - beam.iso_center) @ rot_mat - beam.source_point_bev #160 ms ± 9.3 ms per loop
         t_trace_end = time.perf_counter()
         logger.debug("took %s seconds!", t_trace_end - t_trace_start)
 
@@ -178,12 +178,12 @@ class RayTracerBase(ABC):
         spacing_range = ray_spacing * np.arange(
             np.floor(-500.0 / ray_spacing), np.ceil(500.0 / ray_spacing) + 1, dtype=self.precision
         )
-        candidate_ray_coords_x, candidate_ray_coords_z = np.meshgrid(spacing_range, spacing_range)
+        candidate_ray_coords_x, candidate_ray_coords_z = np.meshgrid(spacing_range, spacing_range) #2.08 ms ± 89.5 μs per loop
 
         # If we have reference positions, we use them to restrict the raytracing region
         reference_positions_bev = ray_matrix_scale * np.array(
             [ray.ray_pos_bev for ray in beam.rays]
-        )
+        ) #167 μs ± 1.74 μs per loop
 
         # use a precompiled numba function to speed up the spatial lookup
         candidate_ray_mx = fast_spatial_circle_lookup(
@@ -191,7 +191,7 @@ class RayTracerBase(ABC):
             candidate_ray_coords_z,
             reference_positions_bev,
             self.lateral_cut_off,
-        )
+        ) #5.66 ms ± 546 μs per loop
 
         # candidate_ray_mx = np.full(candidate_ray_coords_x.shape, False, dtype=np.bool)
 
@@ -208,7 +208,7 @@ class RayTracerBase(ABC):
                 * np.ones(np.sum(candidate_ray_mx), dtype=self.precision).reshape(-1, 1),
                 candidate_ray_coords_z[candidate_ray_mx].reshape(-1, 1),
             )
-        )
+        ) #873 μs ± 5.2 μs per loop
 
         ray_matrix_lps = ray_matrix_bev @ rot_mat.T
 
@@ -255,17 +255,28 @@ class RayTracerBase(ABC):
             np.count_nonzero(ix_remember_from_tracing),
             t_remember_end - t_trace_end,
         )
+
         rad_depth_cubes = [
             np.nan * np.ones_like(sitk.GetArrayViewFromImage(cube), dtype=self.precision)
+
             for cube in self.cubes
-        ]
+        ] #13.1 ms ± 1.7 ms per loo
 
         for i, cube in enumerate(rad_depth_cubes):
-            rel_depths = lengths * rho[i]
-            rel_depths = np.cumsum(rel_depths, axis=1) - rel_depths / 2.0
+            rel_depths = lengths * rho[i] #4.78 ms ± 99.5 μs per loop
+            if cuda.is_available:
+             import cupy as cp
+             r=cp.asarray(rel_depths) #1.51 ms ± 175 μs per loop
+             rel_depths=cp.cumsum(r, axis=1) - r / 2.0 #749 μs ± 4.53 μs per loop
+             rel_depths=rel_depths.get() #5.43 ms ± 25.6 μs per loop
+            else:
+                rel_depths = np.cumsum(rel_depths, axis=1) - rel_depths / 2.0 #18.4 ms ± 697 μs per loop
+                rel_depths=np.cumsum(r, axis=1) - r / 2.0 #749 μs ± 4.53 μs per loop
+           
+            
 
             try:
-                ix_assign = np.unravel_index(ix[ix_remember_from_tracing], cube.shape, order="F")
+                ix_assign = np.unravel_index(ix[ix_remember_from_tracing], cube.shape, order="F") #30.6 ms ± 1.11 ms per loop
             except (ValueError, IndexError):
                 logger.error(
                     "Error in unraveling indices from raytracing. Trying to recover...",
@@ -286,10 +297,10 @@ class RayTracerBase(ABC):
                 )
                 cube[ix_assign] = rel_depths
             else:
-                cube[ix_assign] = rel_depths[ix_remember_from_tracing]
+                cube[ix_assign] = rel_depths[ix_remember_from_tracing] #11.5 ms ± 669 μs per loop
 
-            rad_depth_cubes[i] = sitk.GetImageFromArray(cube)
-            rad_depth_cubes[i].CopyInformation(self.cubes[i])
+            rad_depth_cubes[i] = sitk.GetImageFromArray(cube) #10.8 ms ± 80.7 μs per loop
+            rad_depth_cubes[i].CopyInformation(self.cubes[i]) #2.19 μs ± 2.91 ns per loop 
 
         t_createcubes_end = time.perf_counter()
 
