@@ -1,0 +1,1577 @@
+"""Base class for pencil beam dose calculation algorithms."""
+
+from abc import abstractmethod
+from typing import Any, Literal
+import warnings
+import logging
+import time
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+import SimpleITK as sitk
+import numpy as np
+from scipy import sparse
+import array_api_compat
+#import cupy as self.cp
+import math
+from pyRadPlan.core import resample_image, np2sitk
+from pyRadPlan.ct import CT, default_hlut
+from pyRadPlan.cst import StructureSet
+from pyRadPlan.stf import SteeringInformation
+from pyRadPlan.geometry import get_beam_rotation_matrix
+from pyRadPlan.raytracer import RayTracerSiddon
+from numba import njit,cuda
+import cupyx
+from ._base import DoseEngineBase
+from ...core.xp_utils.typing import Array
+#has_gpu=cuda.is_available()
+#has_gpu=False
+
+
+logger = logging.getLogger(__name__)
+
+"""
+if has_gpu:
+    import cupy as self.cp
+    #from numba import njit,cuda
+"""
+    
+class PencilBeamEngineAbstract(DoseEngineBase):
+    """
+    An abstract class representing the Pencil Beam Engine.
+
+    This class extends DoseEngineBase and provides the foundational structure for implementing a
+    pencil beam dose calculation engine. It includes methods for initializing dose calculations,
+    setting defaults, and various helper methods required for the dose calculation process.
+
+    Attributes
+    ----------
+    keep_rad_depth_cubes : bool
+        Flag to keep radiation depth cubes.
+    geometric_lateral_cutoff : float
+        Lateral geometric cut-off in mm, used for raytracing and geometry.
+    dosimetric_lateral_cutoff : float
+        Relative dosimetric cut-off (in fraction of values calculated).
+    ssd_density_threshold : float
+        Threshold for SSD computation.
+    use_given_eq_density_cube : bool
+        Use the given density cube ct.cube and omit conversion from cubeHU.
+    ignore_outside_densities : bool
+        Ignore densities outside of cst contours.
+    num_of_dij_fill_steps : int
+        Number of times during dose calculation the temporary containers are moved to a sparse
+        matrix.
+    cube_wed : sitk.Image
+        Relative electron density / stopping power cube.
+    hlut : np.ndarray
+        Hounsfield lookup table to create relative electron density cube.
+
+    Methods
+    -------
+    __init__()
+        Initializes the PencilBeamEngineAbstract class.
+    set_defaults()
+        Sets default values for the attributes.
+    _compute_bixel(curr_ray, k)
+        Abstract method to compute bixel.
+    _calc_dose(ct, cst, stf)
+        Calculates the dose.
+    _init_dose_calc(ct, cst, stf)
+        Initializes dose calculation.
+    _allocate_quantity_matrices(dij, names)
+        Allocates quantity matrix containers.
+    _init_beam(curr_beam, ct, cst, stf, i)
+        Initializes the beam.
+    _init_ray(curr_beam, j)
+        Initializes the ray.
+    _extract_single_scenario_ray(ray, scen_idx)
+        Extracts a single scenario ray.
+    _get_ray_geometry_from_beam(ray, curr_beam)
+        Gets ray geometry from beam.
+    _get_lateral_distance_from_dose_cutoff_on_ray(ray)
+        Gets lateral distance from dose cutoff on ray.
+    _fill_dij(bixel, dij, stf, scen_idx, curr_beam_idx, curr_ray_idx, curr_bixel_idx, counter)
+        Fills the dose influence matrix (dij).
+    _finalize_dose(dij)
+        Finalizes the dose.
+    calcGeoDists(rot_coords_bev, sourcePoint_bev, targetPoint_bev, SAD, radDepthIx, lateralCutOff)
+        Calculates geometric distances.
+    geometric_cutoff()
+        Property for geometric cutoff.
+    warn_deprecated_engine_property(old_name, new_name, internal_name)
+        Warns about deprecated engine properties.
+    """
+
+    keep_rad_depth_cubes: bool
+    geometric_lateral_cutoff: float
+    dosimetric_lateral_cutoff: float
+    ssd_density_threshold: float
+    use_given_eq_density_cube: bool
+    ignore_outside_densities: bool
+    trace_on_dose_grid: bool
+    cube_wed: sitk.Image
+    hlut: np.ndarray
+
+    def __init__(self, pln=None):
+        self.keep_rad_depth_cubes = False
+        self.geometric_lateral_cutoff: float = 50
+        self.dosimetric_lateral_cutoff: float = 0.9950
+        self.ssd_density_threshold: float = 0.0500
+        self.use_given_eq_density_cube: bool = False
+        self.ignore_outside_densities: bool = True
+        self.trace_on_dose_grid: bool = True
+        self.cube_wed = None
+        self.hlut = None
+
+        self._computed_quantities = []
+        self._effective_lateral_cutoff = None
+        self._num_of_bixels_container = None
+        self._rad_depth_cubes = []
+        self._raytracer = None
+        self._eps_ijk: Array = None
+        self._has_gpu=True
+        self.kernel=None
+        if self._has_gpu:
+            import cupy as cp
+            self.cp=cp
+            
+
+        
+        
+
+        super().__init__(pln)
+
+    @abstractmethod
+    def _compute_bixel(self, curr_ray, k):
+        raise NotImplementedError("Method _compute_bixel must be implemented in derived class.")
+
+    def _calc_dose(self, ct: CT, cst: StructureSet, stf: SteeringInformation):
+        """
+        Calculate the dose using the pencil beam method.
+
+        Parameters
+        ----------
+        ct : CT
+            The CT object.
+        cst : StructureSet
+            The structure set object.
+        stf : SteeringInformation
+            The steering information object.
+
+        Returns
+        -------
+        dict
+            The dose influence matrix dictionary.
+        """
+       
+        # Initialize
+        dij = self._init_dose_calc(ct, cst, stf) #1.09 s ± 46.6 ms per loop 
+
+        # We loop over scenario in the scenario model
+        # TODO: we need to correctly work out scenarios
+        for shift_scen in range(self.mult_scen.tot_num_shift_scen):
+            # Find first instance of the shift to select the shift values
+            # TODO!: Check for more than one Scenario
+            ix_shift_scen = np.where(self.mult_scen.linear_mask[:, 1] == shift_scen)
+
+            scen_stf = stf
+            # Manipulate isocenter
+            for beam in scen_stf.beams:
+                beam.iso_center += self.mult_scen.iso_shift[ix_shift_scen, :].reshape(-1)
+
+            if self.mult_scen.tot_num_shift_scen > 1:
+                logger.info(
+                    f"Shift scenario {shift_scen} of {self.mult_scen.tot_num_shift_scen}: \n"
+                )
+
+            bixel_counter = 0
+
+            # Loop over all beams
+            with logging_redirect_tqdm():
+                for i in tqdm(range(dij["num_of_beams"]), desc="Beam", unit="b", leave=False):
+                    # Initialize Beam Geometry
+                    t = time.time()
+                    start=time.perf_counter()
+                    curr_beam = self._init_beam(dij, ct, cst, scen_stf, i)
+
+
+                    logger.info("Beam %d initialized in %f seconds.", i + 1, time.time() - t)
+
+                    # Keep tabs on bixels computed in this beam
+                    bixel_beam_counter = 0
+                    
+                    if self._has_gpu:
+                     m=np.count_nonzero(curr_beam["valid_coords_all"])
+                     target_point_bev=curr_beam["beam"]["rays"]
+                     beam_valid_coords_all_device = self.cp.asarray(curr_beam["valid_coords_all"])
+
+
+                     kernel_gpu={
+                     "m" : m,
+                     "bev_coords":self.cp.asarray(curr_beam["bev_coords"][curr_beam["valid_coords_all"], :]),
+                     "source_point_bev":self.cp.asarray(curr_beam["beam"]["source_point_bev"]),
+                     "rot_coords_temp":self.cp.empty((m*3),dtype=self.cp.float32),
+                     "target_point_bev":target_point_bev,
+                     }
+                     other_gpu={
+                         "vdose_grid_device": self.cp.asarray(self._vdose_grid),
+                         "beam_geo_depth" : self.cp.asarray(curr_beam["geo_depths"][0]),
+                         "beam_rad_depths" : self.cp.asarray(curr_beam["rad_depths"][0]),
+                         "beam_valid_coords_all_device" : beam_valid_coords_all_device,
+                         "beam_valid_coords_device": self.cp.asarray(curr_beam["valid_coords"][0]),
+                         "ix_device" : beam_valid_coords_all_device.copy()
+                         }
+                     
+                    # Ray calculation
+                    for j in tqdm(
+                        range(curr_beam["beam"]["num_of_rays"]), desc="Ray", unit="r", leave=False
+                    ):
+                        start = time.perf_counter()
+                        # Initialize Ray Geometry
+                        if self._has_gpu:
+                         curr_ray, curr_ray_gpu = self._init_ray_gpu(curr_beam, j,kernel_gpu,other_gpu) # 7.75 ms ± 14.8 μs
+                        else:
+                         curr_ray = self._init_ray(curr_beam, j) # 59.1 ms ± 1.46 ms
+
+                        # Even if the ray hits nothing, we still emit empty bixel columns
+                        # so that CSC structures and bookkeeping stay consistent.
+                        # The following block might be re-enabled in future to skip empty rays.
+
+                        # check if ray hit anything. If so, skip the computation
+                        # if all(not arr.size for arr in curr_ray["rad_depths"]):
+                        #     continue #continue
+
+                        # TODO: incorporate scenarios correctly
+                        for ct_scen in range(self.mult_scen.num_of_ct_scen):
+                            for range_scen in range(self.mult_scen.tot_num_range_scen):
+                                # Obtain scenario index
+                                full_scen_idx = self.mult_scen.sub2scen_ix(ct_scen, shift_scen, range_scen) # 2.69 μs ± 6.19 ns
+
+                                if self.mult_scen.scen_mask[full_scen_idx]:
+                                    # Extract single scenario ray
+                                    if self._has_gpu :
+                                        scen_ray ,scen_ray_gpu = self._extract_single_scenario_ray_gpu(curr_ray,curr_ray_gpu, full_scen_idx) # 142 μs ± 1.09 μs
+                                        # print('calculate single scen gpu')
+                                    else :
+                                        scen_ray = self._extract_single_scenario_ray(curr_ray, full_scen_idx) # 1.46 ms ± 4.84 μs
+                                    for k in range(curr_ray["num_of_bixels"]):
+                                        # Bixel Computation
+                                        if self._has_gpu : 
+                                            curr_bixel = self._compute_bixel_gpu(scen_ray, scen_ray_gpu,k) # 3.53 ms ± 106 μs
+                                            self._fill_dij_gpu(
+                                                curr_bixel,
+                                                dij,
+                                                scen_stf,
+                                                full_scen_idx,
+                                                i,
+                                                j,
+                                                k,
+                                                bixel_counter + k,
+                                            )
+                                        else :
+                                            # print('pas censé passer par la')
+                                            curr_bixel = self._compute_bixel(scen_ray, k) # 6.87 ms ± 28 μs
+                                            self._fill_dij(
+                                                curr_bixel,
+                                                dij,
+                                                scen_stf,
+                                                full_scen_idx,
+                                                i,
+                                                j,
+                                                k,
+                                                bixel_counter + k,
+                                            )
+                                                                            
+                        # Progress Update & Bookkeeping
+                        bixel_counter += curr_ray["num_of_bixels"]
+                        bixel_beam_counter += curr_ray["num_of_bixels"]
+                        # print(time.perf_counter()-start)
+
+
+        # Finalize dose calculation
+        logger.info("Finalizing dose calculation...")
+        t_start = time.time()
+        dij = self._finalize_dose(dij)
+        t_end = time.time()
+        logger.info("Done in %f seconds.", t_end - t_start)
+
+        
+
+
+        return dij
+
+    def _init_dose_calc(self, ct: CT, cst: StructureSet, stf: SteeringInformation):
+        """
+        Initialize the dose calculation.
+
+        Modified inherited method of the superclass DoseEngine,
+        containing initialization which is specifically needed for
+        pencil beam calculation and not for other engines.
+        """
+
+        dij = super()._init_dose_calc(ct, cst, stf)
+
+        # calculate rED or rSP from HU or take provided wedCube
+        if self.use_given_eq_density_cube and not hasattr(ct, "cube_hu"):
+            logging.warning(
+                "HU Conversion requested to be omitted but no ct.cube exists! "
+                "Will override and do the conversion anyway!"
+            )
+            self.use_given_eq_density_cube = False
+
+        if self.use_given_eq_density_cube:
+            ct_wed = ct.cube_hu
+            logging.info("Omitting HU to rED/rSP conversion and using existing ct.cube!\n")
+        else:
+            # TODO: obtain correct hlut
+            if self.hlut is None:
+                self.hlut = default_hlut()
+            ct_wed = ct.compute_wet(self.hlut)
+
+        self.cube_wed = ct_wed
+
+        # Ignore densities outside of contours
+        if self.ignore_outside_densities:  # TODO: default = None (not tested yet)
+            mask_image = np2sitk.linear_indices_to_sitk_mask(
+                self._vct_grid, self.cube_wed, order="numpy"
+            )
+
+            # # TODO: ct does not yet support multi_scen
+            # for i in range(ct.num_of_ct_scen):
+            #     self.cube_wed.ToScalarImage()
+            #     self.cube_wed[erase_ct_dens_mask == 1] = 0
+
+            # Apply the mask to the cube_wed image
+            self.cube_wed = sitk.Mask(self.cube_wed, mask_image, outsideValue=0)
+
+        # Allocate memory for quantity containers
+        dij = self._allocate_quantity_matrices(dij, ["physical_dose"])
+
+        # Initialize ray-tracer
+        if self.trace_on_dose_grid:
+            wed_cube_trace = resample_image(
+                input_image=self.cube_wed,
+                interpolator=sitk.sitkLinear,
+                target_grid=self.dose_grid,
+            )
+        else:
+            wed_cube_trace = self.cube_wed
+
+        self._raytracer = RayTracerSiddon([wed_cube_trace])
+
+        return dij
+
+    def _allocate_quantity_matrices(self, dij: dict[str, Any], names: list[str]):
+        # Loop over all requested quantities
+        for q_name in names:
+            # Create dij list for each quantity
+            dij[q_name] = np.empty(self.mult_scen.scen_mask.shape, dtype=object)
+
+            # Loop over all scenarios and preallocate quantity containers
+            # TODO: write test for this
+            for i in range(self.mult_scen.scen_mask.size):
+                # Only if there is a scenario we will allocate
+                if self.mult_scen.scen_mask.flat[i]:
+                    if self._calc_dose_direct:
+                        dij[q_name].flat[i] = np.zeros(
+                            (self.dose_grid.num_voxels, dij["num_of_beams"]), dtype=np.float32
+                        )
+                    else:
+                        # We allocate raw csc sparse matrix structures using
+                        # a rough estimat ebased on number of voxels and
+                        # beamlets
+                        est_nnz = np.fix(
+                            5e-4 * self.dose_grid.num_voxels * self._num_of_columns_dij
+                        ).astype(np.int64)
+                        dij[q_name].flat[i] = {
+                            "data": np.empty((est_nnz,), dtype=np.float32),
+                            "indices": np.empty((est_nnz,), dtype=np.int64),
+                            "indptr": np.zeros((self._num_of_columns_dij + 1,), dtype=np.int64),
+                            "nnz": 0,
+                        }
+
+            self._computed_quantities.append(q_name)
+
+        self._effective_lateral_cutoff = self.geometric_lateral_cutoff
+
+        return dij
+    
+    
+    def _allocate_quantity_matrices_gpu(self, dij: dict[str, Any], names: list[str]):
+        # Loop over all requested quantities
+        for q_name in names:
+            # Create dij list for each quantity
+            dij[q_name] = [[[None]*1]]
+
+            # Loop over all scenarios and preallocate quantity containers
+            # TODO: write test for this
+            for i in range(self.mult_scen.scen_mask.size):
+                # Only if there is a scenario we will allocate
+                if self.mult_scen.scen_mask.flat[i]:
+                    if self._calc_dose_direct:
+                        dij[q_name].flat[i] = self.cp.zeros(
+                            (self.dose_grid.num_voxels, dij["num_of_beams"]), dtype=self.cp.float32
+                        )
+                    else:
+                        # We allocate raw csc sparse matrix structures using
+                        # a rough estimat ebased on number of voxels and
+                        # beamlets
+                        est_nnz = int(self.cp.fix(
+                            5e-4 * self.dose_grid.num_voxels * self._num_of_columns_dij
+                        ).astype(self.cp.int64))
+                        dij[q_name][0][0][i] = {
+                            "data": self.cp.empty((est_nnz,), dtype=self.cp.float32),
+                            "indices": self.cp.empty((est_nnz,), dtype=self.cp.int64),
+                            "indptr": self.cp.zeros((self._num_of_columns_dij + 1,), dtype=self.cp.int64),
+                            "nnz": 0,
+                        }
+
+            self._computed_quantities.append(q_name)
+
+        self._effective_lateral_cutoff = self.geometric_lateral_cutoff
+
+        return dij
+
+    def _init_beam(
+        self, _dij: dict, ct: CT, _cst: StructureSet, stf: SteeringInformation, i
+    ) -> dict:
+        """
+        Initialize the beam for pencil beam dose calculation.
+
+        Parameters
+        ----------
+        dij : dict
+            The dose influence matrix dictionary.
+        ct : CT
+            The CT object.
+        _cst : StructureSet
+            The structure set object. Unused here
+        stf : SteeringInformation
+            The steering information object.
+        i : int
+            Index of the beam.
+
+        Returns
+        -------
+        dict
+            Beam Information dictionary
+        """
+        #xp = array_api_compat.array_namespace()
+        # TODO: here .model_dump() is used to get beam as dict. Its possible to change...
+        # ... the ray_tracing to handle this as the model
+        beam_info = {"beam": stf.beams[i].model_dump(), "beam_index": i}
+
+        # Convert voxel indices to real coordinates using iso center of beam i
+        coords_v = self._vox_world_coords - beam_info["beam"]["iso_center"]
+        coords_vdose_grid = self._vox_world_coords_dose_grid - beam_info["beam"]["iso_center"]
+
+        # Get Rotation Matrix
+        beam_info["rot_mat_system_T"] = get_beam_rotation_matrix(
+            beam_info["beam"]["gantry_angle"], beam_info["beam"]["couch_angle"]
+        )
+
+        # Rotate coordinates (1st couch around Y axis, 2nd gantry movement)
+        rot_coords_v = np.dot(coords_v, beam_info["rot_mat_system_T"])
+        rot_coords_vdose_grid = np.dot(coords_vdose_grid, beam_info["rot_mat_system_T"])
+
+        rot_coords_v -= beam_info["beam"]["source_point_bev"]
+        rot_coords_vdose_grid -= beam_info["beam"]["source_point_bev"]
+
+        # Calculate geometric distances
+        
+        geo_dist_vdose_grid = [
+            np.sqrt(np.sum(rot_coords_vdose_grid**2, axis=1)) for _ in range(ct.num_of_ct_scen)
+        ] #18.4 ms ± 1.1 ms per loop
+        
+        
+        
+
+        # Calculate radiological depth cube
+        logger.info("Calculating radiological depth cube...")
+
+        start_time = time.time()
+
+        self._raytracer.debug_core_performance = True
+        rad_depth_cubes = self._raytracer.trace_cubes(beam_info["beam"])
+        self._raytracer.debug_core_performance = False
+
+        # TODO: add universal time-debugging method
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        logger.info("Elapsed time for rayTracing per Beam: %f seconds", elapsed_time)
+
+        beam_info["valid_coords"] = [None] * len(rad_depth_cubes)
+        beam_info["rad_depths"] = [None] * len(rad_depth_cubes)
+
+        for c, rad_depth_cube in enumerate(rad_depth_cubes):
+            if self.trace_on_dose_grid:
+                rad_depth_cube_dose_grid = rad_depth_cube
+            else:
+                rad_depth_cube_dose_grid = resample_image(
+                    input_image=rad_depth_cube,
+                    interpolator=sitk.sitkLinear,
+                    target_grid=self.dose_grid,
+                )
+            if self.keep_rad_depth_cubes:
+                self._rad_depth_cubes.append(rad_depth_cube_dose_grid)
+
+            rad_depth_cube_dosegrid = sitk.GetArrayViewFromImage(rad_depth_cube_dose_grid) #10.8 μs ± 185 ns per loop
+            rad_depth_vdose_grid = rad_depth_cube_dosegrid.ravel()[self._vdose_grid] #1.63 ms ± 84.8 μs per loop
+
+            # Find valid coordinates
+            coord_is_valid = np.isfinite(rad_depth_vdose_grid) #108 μs ± 9.06 μs per loop
+
+            beam_info["valid_coords"][c] = coord_is_valid #86.5 ns ± 0.875 ns per loop
+
+            # TODO: !remove brakets once mutliscen is implemented
+            beam_info["rad_depths"][c] = rad_depth_vdose_grid #77.7 ns ± 2.19 ns per loop
+
+        beam_info["geo_depths"] = geo_dist_vdose_grid
+        beam_info["bev_coords"] = rot_coords_vdose_grid
+
+        beam_info["valid_coords_all"] = np.any(np.vstack(beam_info["valid_coords"]), axis=0)
+
+        # Check existence of target_points
+        if any(r["target_point"] is None for r in beam_info["beam"]["rays"]):
+            logger.debug("Missing target_point in rays. Calculating target points...")
+            for ray in beam_info["beam"]["rays"]:
+                ray["target_point"] = 2 * ray["ray_pos"] - beam_info["beam"]["source_point"]
+                ray["target_point_bev"] = (
+                    2 * ray["ray_pos_bev"] - beam_info["beam"]["source_point_bev"]
+                )
+
+        # Compute SSDs
+        self._compute_ssd(beam_info, ct, density_threshold=self.ssd_density_threshold)
+
+        logger.info("Done.")
+
+        return beam_info
+    
+    
+    
+    
+
+      
+
+    def _init_ray(self, beam_info: dict[str], j: int) -> dict[str]:
+        """
+        Initialize a ray for pencil beam dose calculation.
+
+        Parameters
+        ----------
+        curr_beam : dict
+            The current beam data.
+        j : int
+            The ray index.
+
+        Returns
+        -------
+        dict
+            The initialized ray.
+        """
+        ray = beam_info["beam"]["rays"][j].copy()
+        ray["beam_index"] = beam_info["beam_index"]
+        ray["ray_index"] = j
+        ray["iso_center"] = beam_info["beam"]["iso_center"]
+
+        if "num_of_bixels_per_ray" in beam_info["beam"]:
+            ray["num_of_bixels"] = beam_info["beam"]["num_of_bixels_per_ray"][j]
+        else:
+            # Fallback: use the actual number of beamlets on this ray
+            # This is needed for machines like "Focused" that don't precompute counts.
+            ray["num_of_bixels"] = len(ray.get("beamlets", [])) or 0
+
+        ray["source_point_bev"] = beam_info["beam"]["source_point_bev"]
+        ray["sad"] = beam_info["beam"]["sad"]
+        ray["bixel_width"] = beam_info["beam"]["bixel_width"]
+
+        self._get_ray_geometry_from_beam(ray, beam_info)
+
+        return ray
+    
+    def wrapper(self):
+        def calc_geo_dists_gpu(
+           rot_coords_bev, source_point_bev, target_point_bev, sad, lateral_cutoff,nb_rays,m,rot_coords_temp,subset_mask, rad_distances_sq, lat_dists
+       ):
+           i = cuda.grid(1)
+           if i >= m: #nb operation
+              return
+           a0 = -source_point_bev[0]
+           a1 = -source_point_bev[1]
+           a2 = -source_point_bev[2]
+           norm_a = math.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+           a0 /= norm_a
+           a1 /= norm_a
+           a2 /= norm_a
+           bx = target_point_bev[0] - source_point_bev[0]
+           by = target_point_bev[1] - source_point_bev[1]
+           bz = target_point_bev[2] - source_point_bev[2]
+           norm_b = math.sqrt(bx*bx + by*by + bz*bz)
+           bx /= norm_b
+           by /= norm_b
+           bz /= norm_b
+           cx = a1 * bz - a2 * by
+           cy = a2 * bx - a0 * bz
+           cz = a0 * by - a1 * bx
+           cnorm=math.sqrt(cx * cx + cy * cy + cz * cz)
+           
+           ##################################################
+           tolerance = 1e-7
+           if abs(a0 - bx) < tolerance and abs(a1 - by) < tolerance and abs(a2 - bz) < tolerance:
+            rot_coords_temp[i,0]=rot_coords_bev[i][0]
+            rot_coords_temp[i,1]=rot_coords_bev[i][1]
+            rot_coords_temp[i,2]=rot_coords_bev[i][2]
+           else:
+            cross=cuda.local.array((3,3), dtype=np.float32)
+            ################################################## skew matrix cross product building
+            cross[0, 0] = 0.0
+            cross[0, 1] = -cz
+            cross[0, 2] = cy
+            cross[1, 0] = cz
+            cross[1, 1] = 0.0
+            cross[1, 2] = -cx
+            cross[2, 0] = -cy
+            cross[2, 1] = cx
+            cross[2, 2] = 0.0
+            ##################################################
+            cross2=cuda.local.array((3,3), dtype=np.float32)
+            ##################################################
+            cross2[0, 0] = cross[0, 0] * cross[0, 0]+cross[0, 1] * cross[1, 0]+cross[0, 2] * cross[2, 0]
+            cross2[0, 1] = cross[0, 0] * cross[0, 1]+cross[0, 1] * cross[1, 1]+cross[0, 2] * cross[2, 1]
+            cross2[0, 2] = cross[0, 0] * cross[0, 2]+cross[0, 1] * cross[1, 2]+cross[0, 2] * cross[2, 2]
+            cross2[1, 0] = cross[1, 0] * cross[0, 0]+cross[1, 1] * cross[1, 0]+cross[1, 2] * cross[2, 0]
+            cross2[1, 1] = cross[1, 0] * cross[0, 1]+cross[1, 1] * cross[1, 1]+cross[1, 2] * cross[2, 1]
+            cross2[1, 2] = cross[1, 0] * cross[0, 2]+cross[1, 1] * cross[1, 2]+cross[1, 2] * cross[2, 2]
+            cross2[2, 0] = cross[2, 0] * cross[0, 0]+cross[2, 1] * cross[1, 0]+cross[2, 2] * cross[2, 0]
+            cross2[2, 1] = cross[2, 0] * cross[0, 1]+cross[2, 1] * cross[1, 1]+cross[2, 2] * cross[2, 1]
+            cross2[2, 2] = cross[2, 0] * cross[0, 2]+cross[2, 1] * cross[1, 2]+cross[2, 2] * cross[2, 2]
+            #################################################
+            offset=1-(a0*bx+a1*by+a2*bz)
+            derived_rot_mat=cuda.local.array((3,3),dtype=np.float32)
+            cnorm*=cnorm
+            ##################################################
+            derived_rot_mat[0, 0] = 1.0 + cross[0, 0] + (cross2[0, 0] *offset/(cnorm))
+            derived_rot_mat[0, 1] =  cross[0, 1] + (cross2[0, 1] * offset/(cnorm))
+            derived_rot_mat[0, 2] =  cross[0, 2] + (cross2[0, 2] * offset/(cnorm))
+            derived_rot_mat[1, 0] =  cross[1, 0] + (cross2[1, 0] * offset/(cnorm))
+            derived_rot_mat[1, 1] = 1.0 + cross[1, 1] + (cross2[1, 1] * offset/(cnorm))
+            derived_rot_mat[1, 2] =  cross[1, 2] + (cross2[1, 2] * offset/(cnorm))
+            derived_rot_mat[2, 0] =  cross[2, 0] + (cross2[2, 0] * offset/(cnorm))
+            derived_rot_mat[2, 1] =  cross[2, 1] + (cross2[2, 1] * offset/(cnorm))
+            derived_rot_mat[2, 2] =  1.0 + cross[2, 2] + (cross2[2, 2] * offset/(cnorm))
+            ##################################################
+            rot_coords_temp[i, 0] = rot_coords_bev[i, 0] * derived_rot_mat[0, 0]+rot_coords_bev[i, 1] * derived_rot_mat[1, 0]+rot_coords_bev[i, 2] * derived_rot_mat[2, 0]
+            rot_coords_temp[i, 1] = rot_coords_bev[i, 0] * derived_rot_mat[0, 1]+rot_coords_bev[i, 1] * derived_rot_mat[1, 1]+rot_coords_bev[i, 2] * derived_rot_mat[2, 1]
+            rot_coords_temp[i, 2] = rot_coords_bev[i, 0] * derived_rot_mat[0, 2]+rot_coords_bev[i, 1] * derived_rot_mat[1,2 ]+rot_coords_bev[i, 2] * derived_rot_mat[2, 2]
+           
+           ##################################################
+           lat_dists[i,0]=rot_coords_temp[i,0]+source_point_bev[0]
+           lat_dists[i,1]=rot_coords_temp[i,2]+source_point_bev[2]
+           rad_distances_sq[i]=lat_dists[i,0]**2+lat_dists[i,1]**2
+           subset_mask[i]=rad_distances_sq[i]<=(lateral_cutoff/sad)**2*rot_coords_temp[i,1]**2
+        from numba import cuda
+        tmp=cuda.jit(calc_geo_dists_gpu)
+        self.kernel=tmp
+        return tmp
+        
+    def _init_ray_gpu(self, beam_info: dict[str], j: int,kernel_gpu,other_gpu) -> dict[str]:
+        
+       
+        
+        
+        
+        ray = beam_info["beam"]["rays"][j].copy() # 49.1 ns ± 0.599 ns
+        ray["beam_index"] = beam_info["beam_index"] # 43.1 ns ± 0.54 ns
+        ray["ray_index"] = j # 34.2 ns ± 1.02 ns
+        ray["iso_center"] = beam_info["beam"]["iso_center"] # 56.2 ns ± 2.17 ns
+        if "num_of_bixels_per_ray" in beam_info["beam"]:
+            ray["num_of_bixels"] = beam_info["beam"]["num_of_bixels_per_ray"][j] # 108 ns ± 2.52 ns
+        else:
+            ray["num_of_bixels"] = len(ray.get("beamlets", [])) or 0
+        ray["source_point_bev"] = beam_info["beam"]["source_point_bev"] # 54.6 ns ± 0.952 ns
+        ray["sad"] = beam_info["beam"]["sad"] # 54.2 ns ± 1.85 ns
+        ray["bixel_width"] = beam_info["beam"]["bixel_width"] # 54.1 ns ± 1.79 ns
+        ray["effective_lateral_cut_off"] = beam_info.get("effective_lateral_cut_off", self._effective_lateral_cutoff) # 65.4 ns ± 0.258 ns 
+
+        threads_per_block = 128 # 15.7 ns ± 0.772 ns
+        blocks_per_grid = (kernel_gpu["m"]+threads_per_block-1)//threads_per_block # 72.7 ns ± 2.32 ns
+        radial_dist_sq_device=self.cp.empty((kernel_gpu["m"]),dtype=self.cp.float32) # 3.9 μs ± 22.5 ns
+        lat_dists_device=self.cp.empty((kernel_gpu["m"],2),dtype=self.cp.float32) # 4.01 μs ± 25.7 ns
+        subset_mask_device=self.cp.empty((kernel_gpu["m"]),dtype=self.cp.int32) # 4.05 μs ± 40.7 ns
+
+        # cuda.synchronize() # 
+        nb_rays=beam_info["beam"]["num_of_rays"] # 39.5 ns ± 1.36 ns
+        """
+        if self.kernel is None:
+            self.wrapper()
+        self.kernel[blocks_per_grid, threads_per_block](
+        kernel_gpu["bev_coords"],
+        kernel_gpu["source_point_bev"],
+        self.cp.asarray(kernel_gpu["target_point_bev"][j]["target_point_bev"]),
+        ray["sad"],
+        self._get_lateral_distance_from_dose_cutoff_on_ray(ray),
+        nb_rays,
+        kernel_gpu["m"],
+        kernel_gpu["rot_coords_temp"],
+        subset_mask_device,
+        radial_dist_sq_device,
+        lat_dists_device
+        ) # 5.77 ms ± 1.6 ms (x6 pour la premiere compilation)
+        ##6.74 ms ± 1.51 ms per loop 1st
+        #2.61 ms ± 85 μs per loop 2nd
+        """
+        
+        
+        
+        
+        
+        
+        
+        mod=self.cp.RawKernel(r'''
+        extern "C" __global__ void geo_dist(float* rot_coords_bev, float* source_point_bev, float* target_point_bev, float sad, float lateral_cutoff,int nb_rays,int m,float* rot_coords_temp,int* subset_mask, float* rad_distances_sq, float* lat_dists)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= m)
+         return;
+        float a0 = -source_point_bev[0];
+        float a1 = -source_point_bev[1];
+        float a2 = -source_point_bev[2];
+        float norm_a = rsqrtf(a0 * a0 + a1 * a1 + a2 * a2);
+        a0 *= norm_a;
+        a1 *= norm_a;
+        a2 *= norm_a;
+        float bx = target_point_bev[0] - source_point_bev[0];
+        float by = target_point_bev[1] - source_point_bev[1];
+        float bz = target_point_bev[2] - source_point_bev[2];
+        float norm_b = rsqrtf(bx*bx + by*by + bz*bz);
+        bx *= norm_b;
+        by *= norm_b;
+        bz *= norm_b;
+        float cx = a1 * bz - a2 * by;
+        float cy = a2 * bx - a0 * bz;
+        float cz = a0 * by - a1 * bx;
+        float cnorm=cx * cx + cy * cy + cz * cz;
+        float tolerance = 1e-7f;
+        float cross[9];
+        float cross2[9];
+        float derived_rot_mat[9];
+
+        if (fabsf(a0 - bx) < tolerance && fabsf(a1 - by) < tolerance && fabsf(a2 - bz) < tolerance)
+        { 
+            rot_coords_temp[i*3+0]=rot_coords_bev[i*3+0];
+            rot_coords_temp[i*3+1]=rot_coords_bev[i*3+1];
+            rot_coords_temp[i*3+2]=rot_coords_bev[i*3+2];
+        }
+        else
+        {
+            cross[0*3+0] = 0.0f;
+            cross[0*3+1] = -cz;
+            cross[0*3+2] = cy;
+            cross[1*3+0] = cz;
+            cross[1*3+1] = 0.0f;
+            cross[1*3+2] = -cx;
+            cross[2*3+0] = -cy;
+            cross[2*3+1] = cx;
+            cross[2*3+2] = 0.0f;
+            cross2[0*3+0] = cross[0*3+0] * cross[0*3+0]+cross[0*3+1] * cross[1*3+0]+cross[0*3+2] * cross[2*3+0];
+            cross2[0*3+1] = cross[0*3+0] * cross[0*3+1]+cross[0*3+1] * cross[1*3+1]+cross[0*3+2] * cross[2*3+1];
+            cross2[0*3+2] = cross[0*3+0] * cross[0*3+2]+cross[0*3+1] * cross[1*3+2]+cross[0*3+2] * cross[2*3+2];
+            cross2[1*3+0] = cross[1*3+0] * cross[0*3+0]+cross[1*3+1] * cross[1*3+0]+cross[1*3+2] * cross[2*3+0];
+            cross2[1*3+1] = cross[1*3+0] * cross[0*3+1]+cross[1*3+1] * cross[1*3+1]+cross[1*3+2] * cross[2*3+1];
+            cross2[1*3+2] = cross[1*3+0] * cross[0*3+2]+cross[1*3+1] * cross[1*3+2]+cross[1*3+2] * cross[2*3+2];
+            cross2[2*3+0] = cross[2*3+0] * cross[0*3+0]+cross[2*3+1] * cross[1*3+0]+cross[2*3+2] * cross[2*3+0];
+            cross2[2*3+1] = cross[2*3+0] * cross[0*3+1]+cross[2*3+1] * cross[1*3+1]+cross[2*3+2] * cross[2*3+1];
+            cross2[2*3+2] = cross[2*3+0] * cross[0*3+2]+cross[2*3+1] * cross[1*3+2]+cross[2*3+2] * cross[2*3+2];
+            float offset=1-(a0*bx+a1*by+a2*bz);
+            derived_rot_mat[0*3+0] = 1.0f + cross[0*3+0] + (cross2[0*3+0] *offset/(cnorm));
+            derived_rot_mat[0*3+1] =  cross[0*3+1] + (cross2[0*3+1] * offset/(cnorm));
+            derived_rot_mat[0*3+2] =  cross[0*3+2] + (cross2[0*3+2] * offset/(cnorm));
+            derived_rot_mat[1*3+0] =  cross[1*3+0] + (cross2[1*3+0] * offset/(cnorm));
+            derived_rot_mat[1*3+1] = 1.0f + cross[1*3+1] + (cross2[1*3+1] * offset/(cnorm));
+            derived_rot_mat[1*3+2] =  cross[1*3+2] + (cross2[1*3+2] * offset/(cnorm));
+            derived_rot_mat[2*3+0] =  cross[2*3+0] + (cross2[2*3+0] * offset/(cnorm));
+            derived_rot_mat[2*3+1] =  cross[2*3+1] + (cross2[2*3+1] * offset/(cnorm));
+            derived_rot_mat[2*3+2] =  1.0f + cross[2*3+2] + (cross2[2*3+2] * offset/(cnorm));
+            rot_coords_temp[i*3+0] = rot_coords_bev[i*3+0] * derived_rot_mat[0*3+0]+rot_coords_bev[i*3+1] * derived_rot_mat[1*3+0]+rot_coords_bev[i*3+2] * derived_rot_mat[2*3+0];
+            rot_coords_temp[i*3+1] = rot_coords_bev[i*3+0] * derived_rot_mat[0*3+1]+rot_coords_bev[i*3+1] * derived_rot_mat[1*3+1]+rot_coords_bev[i*3+2] * derived_rot_mat[2*3+1];
+            rot_coords_temp[i*3+2] = rot_coords_bev[i*3+0] * derived_rot_mat[0*3+2]+rot_coords_bev[i*3+1] * derived_rot_mat[1*3+2]+rot_coords_bev[i*3+2] * derived_rot_mat[2*3+2];    
+        }            
+        lat_dists[i*2+0]=rot_coords_temp[i*3+0]+source_point_bev[0];
+        lat_dists[i*2+1]=rot_coords_temp[i*3+2]+source_point_bev[2];
+        rad_distances_sq[i]=lat_dists[i*2+0]*lat_dists[i*2+0]+lat_dists[i*2+1]*lat_dists[i*2+1];
+        subset_mask[i]=rad_distances_sq[i]<=((lateral_cutoff/sad)*(lateral_cutoff/sad)*rot_coords_temp[i*3+1]*rot_coords_temp[i*3+1]);
+                 
+    }
+    ''','geo_dist')
+        mod((blocks_per_grid,),(128,),(kernel_gpu["bev_coords"].astype(self.cp.float32).flatten(),kernel_gpu["source_point_bev"].astype(self.cp.float32),self.cp.asarray(kernel_gpu["target_point_bev"][j]["target_point_bev"].astype(np.float32)),np.float32(ray["sad"]),np.float32(self._get_lateral_distance_from_dose_cutoff_on_ray(ray)),np.int32(nb_rays),np.int32(kernel_gpu["m"]),kernel_gpu["rot_coords_temp"].astype(np.float32),subset_mask_device,radial_dist_sq_device,lat_dists_device))   
+        lat_dists_device=lat_dists_device.reshape((kernel_gpu["m"],2))#437 μs ± 7.96 μs per loop
+        
+                           
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+                                    
+        subset_mask_device = subset_mask_device.astype(self.cp.bool_) # 34.3 μs ± 281 ns
+        idx = self.cp.nonzero(subset_mask_device)[0] # 236 μs ± 983 ns
+        radial_dist_sq_device = self.cp.take(radial_dist_sq_device, idx) # 55.3 μs ± 711 ns
+        lat_dists_device = self.cp.take(lat_dists_device, idx, axis=0) # 112 μs ± 7.05 μs
+        other_gpu["ix_device"][other_gpu["beam_valid_coords_all_device"]] = subset_mask_device # 510 μs ± 83.3 μs
+
+        ray_valid_coords_device =   other_gpu["ix_device"]& other_gpu["beam_valid_coords_device"] # 77.2 μs ± 628 ns
+        ray_idx = self.cp.where(ray_valid_coords_device)[0] # 281 μs ± 548 ns
+        ray_ix_device = other_gpu["vdose_grid_device"][ray_idx] # 79.4 μs ± 307 ns
+        ix_idx = self.cp.where(other_gpu["ix_device"])[0] # 281 μs ± 479 ns
+        local_mask = ray_valid_coords_device[ix_idx] # 49.2 μs ± 1.38 μs
+        ray_radial_dist_sq_device = radial_dist_sq_device[local_mask] # 296 μs ± 3.27 μs
+        ray_lat_dists_device = self.cp.take(lat_dists_device, ray_idx, axis=0) # 105 μs ± 1.69 μs
+        ray_geo_depths_device = other_gpu["beam_geo_depth"][ray_idx] # 79.2 μs ± 286 ns 
+        ray_rad_depths_device = other_gpu["beam_rad_depths"][ray_idx] # 55.9 μs ± 308 ns
+        ray_valid_coords_all_device = self.cp.any(ray_valid_coords_device) # 61.1 μs ± 871 ns
+        
+        
+        ray_gpu = {"valid_coords": [ray_valid_coords_device],
+                   "ix": [ray_ix_device],
+                   "radial_dist_sq": [ray_radial_dist_sq_device],
+                   "lat_dists": [ray_lat_dists_device],
+                   "valid_coords_all": [ray_valid_coords_all_device],
+                   "geo_depths": [ray_geo_depths_device],
+                   "rad_depths": [ray_rad_depths_device],
+                   } # 192 ns ± 1.96 ns
+        
+        
+        ray["sigma_ini"] = self._calc_sigma_ini_on_ray(ray) # 67.8 μs ± 458 ns
+        if self.air_offset_correction:
+           nozzle_to_skin = (ray["SSD"] + self._machine.bams_to_iso_dist) - self._machine.sad # 82.1 ns ± 2.65 ns
+           ray["rad_depth_offset"] = 0.0011 * (nozzle_to_skin - self._machine.fit_air_offset) # 75.2 ns ± 2.31 ns
+        else:
+           ray["rad_depth_offset"] = 0 # 
+
+        return ray, ray_gpu
+
+    def _compute_ssd(
+        self,
+        beam_info: dict,
+        _ct: CT,
+        mode: Literal["first"] = "first",
+        density_threshold: float = 0.05,
+        show_warning: bool = True,
+    ):
+        """
+        Compute SSD (Source to Surface Distance) for each ray.
+
+        Parameters
+        ----------
+        beam_info : dict
+            Beam Information, will be modified to include SSD.
+        ct : CT
+            The CT object.
+        mode : Literal["first"], optional
+            Mode for handling multiple cubes to compute one SSD. Only 'first' is implemented.
+        density_threshold : float, optional
+            Value determining the skin threshold.
+        show_warning : bool, optional
+            Flag to show warnings.
+        """
+
+        beam = beam_info["beam"]
+
+        # TODO: Add MultiScenario Support - remove this line
+        if mode == "first":
+            ssd = [None] * beam["num_of_rays"]
+
+            ray_pos_bev = np.array([ray["ray_pos_bev"] for ray in beam["rays"]]) #134 μs ± 1.56 μs per loop 
+            target_points = np.array([ray["target_point"] for ray in beam["rays"]]) #135 μs ± 1.72 μs per loop
+
+            alpha, _, rho, d12, _ = self._raytracer.trace_rays(
+                beam["iso_center"],
+                beam["source_point"].reshape((1, 3)),
+                target_points,
+            ) #74.9 ms ± 2.62 ms per loop
+
+            # find rays that do not hit patients
+            ix_nan = np.all(np.isnan(rho[0]), axis=1) #21.6 μs ± 53.9 ns per loop
+            if np.any(ix_nan):
+                msg = f"{ix_nan.sum()} rays do not hit patient. Trying to fix afterwards..."
+                if show_warning:
+                    warnings.warn(msg)
+                else:
+                    logger.warning(msg)
+
+            ix_ssd = -1 * np.ones_like(ix_nan, dtype=np.int64) #4.54 μs ± 69.4 ns per loop
+            ix_ssd[~ix_nan] = np.argmax(rho[0][~ix_nan] > density_threshold, axis=1) #67.8 μs ± 657 ns per loop
+
+            ssd = beam["sad"] * np.ones_like(ix_ssd, dtype=np.float32) #5.09 μs ± 8.57 ns per loop
+
+            ssd[~ix_nan] = d12[~ix_nan].squeeze() * alpha[~ix_nan, ix_ssd[~ix_nan]] #15.2 μs ± 103 ns per loop
+
+            # Now assign the ssd to all rays
+            for j, ray in enumerate(beam["rays"]):
+                if ix_nan[j]:  # Try to fix SSD by using SSD of closest neighboring ray
+                    ray["SSD"] = self._closest_neighbor_ssd(ray_pos_bev, ssd, ray["ray_pos_bev"])
+                else:
+                    ray["SSD"] = float(ssd[j])
+
+        else:
+            raise ValueError(f"Invalid mode {mode} for SSD calculation")
+
+        beam_info["beam"] = beam
+        
+        
+    
+
+    def _closest_neighbor_ssd(
+        self, ray_pos_bev: np.ndarray, ssd: np.ndarray, curr_pos: np.ndarray
+    ) -> float:
+        """
+        Find the closest neighboring ray's SSD.
+
+        Parameters
+        ----------
+        ray_pos_bev : np.ndarray
+            Array of ray positions.
+        curr_pos : np.ndarray
+            Current ray position.
+
+        Returns
+        -------
+        float
+            SSD value of the closest neighboring ray.
+        """
+        distances = np.sum((ray_pos_bev - curr_pos) ** 2, axis=1)
+        sorted_indices = np.argsort(distances)
+        for ix in sorted_indices:
+            if ssd[ix] is not None:
+                return float(ssd[ix])
+        raise ValueError(
+            "Error in SSD calculation: Could not fix SSD calculation by using closest neighboring "
+            "ray."
+        )
+
+        #
+        # """Find the closest neighbor to ray j and return its SSD."""
+        # distances = np.linalg.norm(ray_pos_bev - ray_pos_bev[j], axis=1)
+        # distances[j] = np.inf
+        # return SSD[np.argmin(distances)]
+
+    def _extract_single_scenario_ray(self, ray: dict, scen_idx: int):
+        """
+        Extract a single scenario ray and adapt radiological depths.
+
+        Parameters
+        ----------
+        ray (dict):
+            The ray data.
+        scen_idx (int):
+            The scenario index.
+
+        Returns
+        -------
+        dict:
+            The scenario ray with adapted radiological depths.
+        """
+        # Gets number of scenario
+        scen_num = self.mult_scen.scen_num(scen_idx) # 4.92 μs ± 38.9 ns
+        ct_scen = self.mult_scen.linear_mask[0][scen_num] # 1.63 μs ± 9.53 ns
+
+        # First, create a ray of the specific scenario to adapt rad depths
+        scen_ray = ray.copy() # 142 ns ± 1.02 ns
+        scen_ray["rad_depths"] = scen_ray["rad_depths"][ct_scen] # 61 ns ± 1.24 ns
+        scen_ray["rad_depths"] = (1 + self.mult_scen.rel_range_shift[scen_num]) * scen_ray[
+            "rad_depths"
+        ] + self.mult_scen.abs_range_shift[scen_num] # 3.41 μs ± 15.1 ns
+        scen_ray["radial_dist_sq"] = scen_ray["radial_dist_sq"][ct_scen] # 61.5 ns ± 2.05 ns
+        scen_ray["ix"] = scen_ray["ix"][ct_scen] # 61.9 ns ± 2.64 ns
+
+        if self.mult_scen.abs_range_shift[scen_num] < 0:
+            # TODO: better way to handle this?
+            scen_ray["rad_depths"][scen_ray["rad_depths"] < 0] = 0
+
+        if "geo_depths" in scen_ray:
+            scen_ray["geo_depths"] = scen_ray["geo_depths"][ct_scen] # 62.6 ns ± 1.3 ns
+
+        if "lat_dists" in scen_ray:
+            scen_ray["lat_dists"] = scen_ray["lat_dists"][ct_scen] # 60 ns ± 1.04 ns
+
+        if "iso_lat_dists" in scen_ray:
+            scen_ray["iso_lat_dists"] = scen_ray["iso_lat_dists"][ct_scen]
+
+        return scen_ray
+
+    def _extract_single_scenario_ray_gpu(self, ray: dict, ray_gpu, scen_idx: int):
+        # lignes communes indispensables
+       scen_num = self.mult_scen.scen_num(scen_idx) # 4.92 μs ± 38.9 ns
+       ct_scen = self.mult_scen.linear_mask[0][scen_num] # 1.63 μs ± 9.53 ns
+       
+       #  version GPU
+       scen_ray_gpu = ray_gpu.copy() # 69.4 ns ± 0.488 ns
+       scen_ray_gpu["rad_depths"] = scen_ray_gpu["rad_depths"][ct_scen] # 58.2 μs ± 206 ns
+       scen_ray_gpu["rad_depths"] = (1 + self.mult_scen.rel_range_shift[scen_num]) * scen_ray_gpu[
+           "rad_depths"
+       ] + self.mult_scen.abs_range_shift[scen_num] # 111 μs ± 6.26 μs
+       scen_ray_gpu["radial_dist_sq"] = scen_ray_gpu["radial_dist_sq"][ct_scen] # 52.7 μs ± 847 ns
+       scen_ray_gpu["ix"] = scen_ray_gpu["ix"][ct_scen] # 54 μs ± 1.26 μs
+       if self.mult_scen.abs_range_shift[scen_num] < 0:
+           scen_ray_gpu["rad_depths"][scen_ray_gpu["rad_depths"] < 0] = 0
+       if "geo_depths" in scen_ray_gpu:
+           scen_ray_gpu["geo_depths"] = scen_ray_gpu["geo_depths"][ct_scen] # 54.6 μs ± 1.46 μs
+       if "lat_dists" in scen_ray_gpu:
+           scen_ray_gpu["lat_dists"] = scen_ray_gpu["lat_dists"][ct_scen] # 60.8 μs ± 1.54 μs
+       if "iso_lat_dists" in scen_ray_gpu:
+           scen_ray_gpu["iso_lat_dists"] = scen_ray_gpu["iso_lat_dists"][ct_scen]
+       # la version GPU est allourdie par la gestion en dictionnaires, peut être sous optimal.
+       
+       # partie self.cpU
+       scen_ray = ray.copy() # 142 ns ± 1.02 ns
+
+       return scen_ray, scen_ray_gpu
+
+    def _get_ray_geometry_from_beam(self, ray: dict[str], beam_info: dict[str]):
+        ray["effective_lateral_cut_off"] = beam_info.get(
+            "effective_lateral_cut_off", self._effective_lateral_cutoff
+        )
+        lateral_ray_cutoff = self._get_lateral_distance_from_dose_cutoff_on_ray(ray)
+
+        # Ray tracing for beam i and ray j
+        start=time.perf_counter()
+        ix, radial_dist_sq, lat_dists, iso_lat_dists = self.calc_geo_dists(
+            beam_info["bev_coords"],
+            ray["source_point_bev"],
+            ray["target_point_bev"],
+            ray["sad"],
+            beam_info["valid_coords_all"],
+            lateral_ray_cutoff,
+        )
+        global geo_dist
+        geo_dist+=time.perf_counter()-start
+
+        # Subindex given the relevant indices from the geometric distance calculation
+        ray["valid_coords"] = [beam_ix & ix for beam_ix in beam_info["valid_coords"]]
+        ray["ix"] = [self._vdose_grid[ix_in_grid] for ix_in_grid in ray["valid_coords"]]
+
+        ray["radial_dist_sq"] = [radial_dist_sq[beam_ix[ix]] for beam_ix in ray["valid_coords"]]
+        ray["lat_dists"] = [lat_dists[beam_ix[ix]] for beam_ix in ray["valid_coords"]]
+        ray["iso_lat_dists"] = [iso_lat_dists[beam_ix[ix]] for beam_ix in ray["valid_coords"]]
+
+        ray["valid_coords_all"] = np.any(np.vstack(ray["valid_coords"]), axis=0)
+
+        ray["geo_depths"] = [
+            rD[ix] for rD, ix in zip(beam_info["geo_depths"], ray["valid_coords"])
+        ]  # usually not needed for particle beams
+        ray["rad_depths"] = [
+            rD[ix] for rD, ix in zip(beam_info["rad_depths"], ray["valid_coords"])
+        ]
+
+    def _get_lateral_distance_from_dose_cutoff_on_ray(self, ray: dict) -> float:
+        """
+        Obtain the maximum lateral cutoff on a a ray.
+
+        Distance will computed from dosimetric cutoff setting.
+
+        Parameters
+        ----------
+        _ray : dict
+            The ray data. Unused in this base implementation.
+
+        Returns
+        -------
+        float
+            The lateral distance from the dose cutoff on the ray.
+        """
+
+        return ray.get("effective_lateral_cut_off", self._effective_lateral_cutoff)
+
+    def _fill_dij(
+        self,
+        bixel: dict,
+        dij: dict,
+        _stf: SteeringInformation,
+        scen_idx: int,
+        curr_beam_idx: int,
+        curr_ray_idx: int,
+        curr_bixel_idx: int,
+        bixel_counter: int,
+    ):
+        """
+        Fill the dose influence matrix (dij) with bixel contents.
+
+        This is the last step in bixel dose calculation. It will fill all
+        the computed quantities into sparse matrix containers.
+        If forward calculation is active, accumulation into dense vectors
+        will be performed instead.
+
+        Parameters
+        ----------
+        bixel : dict
+            The bixel data.
+        dij : dict
+            The dose influence matrix.
+        stf : SteeringInformation
+            The structure containing beam information.
+            Unused in this base implementation.
+        scen_idx : int
+            The scenario index.
+        curr_beam_idx : int
+            The current beam index.
+        curr_ray_idx : int
+            The current ray index.
+        curr_bixel_idx : int
+            The current bixel index.
+        bixel_counter : int
+            The counter for the bixels.
+
+        Returns
+        -------
+        dict
+            The updated dose influence matrix.
+        """
+        # Determine if we have entries to store for this bixel
+        ix_size = 0
+        if bixel and "ix" in bixel:
+            ix_val = bixel["ix"]
+            try:
+                ix_size = ix_val.size
+            except AttributeError:
+                ix_size = len(ix_val)
+
+        sub_scen_idx = tuple(np.unravel_index(scen_idx, self.mult_scen.scen_mask.shape))
+
+        for q_name in self._computed_quantities:
+            if self._calc_dose_direct:
+                if ix_size > 0:
+                    dij[q_name][sub_scen_idx][bixel["ix"], curr_beam_idx] += (
+                        bixel["weight"] * bixel[q_name]
+                    )
+            else:
+                data_dict = dij[q_name][sub_scen_idx]
+                # Advance column pointer even when ix_size == 0 to keep CSC valid
+                start = data_dict["indptr"][bixel_counter]
+                end = start + ix_size
+                data_dict["indptr"][bixel_counter + 1] = end
+
+                if ix_size > 0:
+                    need_nnz = data_dict["nnz"] + ix_size
+                    if data_dict["data"].size < need_nnz:
+                        logger.debug("Resizing data and indices arrays for %s...", q_name)
+                        grow = max(
+                            ix_size, (self._num_of_columns_dij - bixel_counter) * (ix_size + 1)
+                        )
+                        new_size = data_dict["data"].size + grow
+                        data_dict["data"].resize((new_size,), refcheck=False)
+                        data_dict["indices"].resize((new_size,), refcheck=False)
+
+                    # Fill values and indices into the allocated slice
+                    data_dict["data"][start:end] = bixel[q_name]
+                    data_dict["indices"][start:end] = bixel["ix"]
+                    data_dict["nnz"] += ix_size
+
+        # Bookkeeping of bixel numbers
+        # remember beam and bixel number
+        if self._calc_dose_direct:
+            dij["beam_num"][curr_beam_idx] = curr_beam_idx
+            dij["ray_num"][curr_beam_idx] = curr_beam_idx
+            dij["bixel_num"][curr_beam_idx] = curr_beam_idx
+        else:
+            dij["beam_num"][bixel_counter] = curr_beam_idx
+            dij["ray_num"][bixel_counter] = curr_ray_idx
+            dij["bixel_num"][bixel_counter] = curr_bixel_idx
+            
+    def _fill_dij_gpu2(
+        self,
+        bixel: dict,
+        dij: dict,
+        _stf: SteeringInformation,
+        scen_idx: int,
+        curr_beam_idx: int,
+        curr_ray_idx: int,
+        curr_bixel_idx: int,
+        bixel_counter: int,
+    ):
+        #bixel["physical_dose"] = bixel["physical_dose"].get()
+        ix_size = 0
+        if bixel and "ix" in bixel:
+            ix_val = bixel["ix"]
+            try:
+                ix_size = ix_val.size
+            except AttributeError:
+                ix_size = len(ix_val)
+        sub_scen_idx = tuple(np.unravel_index(scen_idx, self.mult_scen.scen_mask.shape))
+        for q_name in self._computed_quantities:
+            if self._calc_dose_direct:
+                if ix_size > 0:
+                    dij[q_name][sub_scen_idx][bixel["ix"], curr_beam_idx] += (
+                        bixel["weight"] * bixel[q_name]
+                    )
+            else:
+                data_dict = dij[q_name][0][0][0]
+                #data_dict = dij[q_name][0]
+                # Advance column pointer even when ix_size == 0 to keep CSC valid
+                start = data_dict["indptr"][bixel_counter]
+                end = start + ix_size
+                data_dict["indptr"][bixel_counter + 1] = end
+    
+                if ix_size > 0:
+                    need_nnz = data_dict["nnz"] + ix_size
+                    if data_dict["data"].size < need_nnz:
+                        logger.debug("Resizing data and indices arrays for %s...", q_name)
+                        grow = max(
+                            ix_size, (self._num_of_columns_dij - bixel_counter) * (ix_size + 1)
+                        )
+                        new_size = data_dict["data"].size + grow
+                        data_dict["data"]=self.cp.resize(data_dict["data"],new_size)
+                        data_dict["indices"]=self.cp.resize(data_dict["indices"],new_size)
+    
+                    # Fill values and indices into the allocated slice
+                    data_dict["data"][start:end] = bixel[q_name]
+                    data_dict["indices"][start:end] = self.cp.asarray(bixel["ix"])
+                    data_dict["nnz"] += ix_size
+    
+        # Bookkeeping of bixel numbers
+        # remember beam and bixel number
+        if self._calc_dose_direct:
+            dij["beam_num"][curr_beam_idx] = curr_beam_idx
+            dij["ray_num"][curr_beam_idx] = curr_beam_idx
+            dij["bixel_num"][curr_beam_idx] = curr_beam_idx
+        else:
+            dij["beam_num"][bixel_counter] = curr_beam_idx
+            dij["ray_num"][bixel_counter] = curr_ray_idx
+            dij["bixel_num"][bixel_counter] = curr_bixel_idx
+            
+            
+            
+            
+    def _fill_dij_gpu(
+        self,
+        bixel: dict,
+        dij: dict,
+        _stf: SteeringInformation,
+        scen_idx: int,
+        curr_beam_idx: int,
+        curr_ray_idx: int,
+        curr_bixel_idx: int,
+        bixel_counter: int,
+    ):
+        bixel["physical_dose"] = bixel["physical_dose"].get()
+        ix_size = 0
+        if bixel and "ix" in bixel:
+            ix_val = bixel["ix"]
+            try:
+                ix_size = ix_val.size
+            except AttributeError:
+                ix_size = len(ix_val)
+        sub_scen_idx = tuple(np.unravel_index(scen_idx, self.mult_scen.scen_mask.shape))
+        for q_name in self._computed_quantities:
+            if self._calc_dose_direct:
+                if ix_size > 0:
+                    dij[q_name][sub_scen_idx][bixel["ix"], curr_beam_idx] += (
+                        bixel["weight"] * bixel[q_name]
+                    )
+            else:
+                data_dict = dij[q_name][sub_scen_idx]
+                # Advance column pointer even when ix_size == 0 to keep CSC valid
+                start = data_dict["indptr"][bixel_counter]
+                end = start + ix_size
+                data_dict["indptr"][bixel_counter + 1] = end
+    
+                if ix_size > 0:
+                    need_nnz = data_dict["nnz"] + ix_size
+                    if data_dict["data"].size < need_nnz:
+                        logger.debug("Resizing data and indices arrays for %s...", q_name)
+                        grow = max(
+                            ix_size, (self._num_of_columns_dij - bixel_counter) * (ix_size + 1)
+                        )
+                        new_size = data_dict["data"].size + grow
+                        data_dict["data"].resize((new_size,), refcheck=False)
+                        data_dict["indices"].resize((new_size,), refcheck=False)
+    
+                    # Fill values and indices into the allocated slice
+                    data_dict["data"][start:end] = bixel[q_name]
+                    data_dict["indices"][start:end] = bixel["ix"]
+                    data_dict["nnz"] += ix_size
+    
+        # Bookkeeping of bixel numbers
+        # remember beam and bixel number
+        if self._calc_dose_direct:
+            dij["beam_num"][curr_beam_idx] = curr_beam_idx
+            dij["ray_num"][curr_beam_idx] = curr_beam_idx
+            dij["bixel_num"][curr_beam_idx] = curr_beam_idx
+        else:
+            dij["beam_num"][bixel_counter] = curr_beam_idx
+            dij["ray_num"][bixel_counter] = curr_ray_idx
+            dij["bixel_num"][bixel_counter] = curr_bixel_idx
+
+
+    def _finalize_dose(self, dij: dict):
+        """
+        Finalize the dose influence matrix.
+
+        Pruning the matrix and concatenating the containers to a compressed
+        sparse matrix.
+
+        Parameters
+        ----------
+        dij : dict
+            The dose influence matrix.
+
+        Returns
+        -------
+        Dij
+            The finalized dose influence matrix.
+        """
+
+        # Loop over all scenarios and remove dose influence for voxels outside of segmentations
+        for i in range(self.mult_scen.scen_mask.size):
+            # Only if there is a scenario we will allocate
+            if self.mult_scen.scen_mask.flat[i]:
+                # Loop over all used quantities
+                for q_name in self._computed_quantities:
+                    if not self._calc_dose_direct:
+                        # tmp_matrix = cast(sparse.lil_matrix, dij[q_name].flat[i])
+                        # tmp_matrix = tmp_matrix.tocsr().T
+                        data_dict = dij[q_name].flat[i]
+
+                        # Resize to the actual number of non-zero elements
+                        data_dict["data"].resize((data_dict["nnz"],), refcheck=False)
+                        data_dict["indices"].resize((data_dict["nnz"],), refcheck=False)
+
+                        # Create the matrix, avoid copies
+                        tmp_matrix = sparse.csc_array(
+                            (data_dict["data"], data_dict["indices"], data_dict["indptr"]),
+                            shape=(self.dose_grid.num_voxels, self._num_of_columns_dij),
+                            dtype=np.float32,
+                            copy=False,
+                        )
+
+                        # Do we need this?
+                        tmp_matrix.eliminate_zeros()
+
+                        # make sure indices are sorted and matrix is canonical
+                        if not tmp_matrix.has_sorted_indices:
+                            logger.debug("Sorting indices for %s...", q_name)
+                            tmp_matrix.sort_indices()
+
+                        if not tmp_matrix.has_canonical_format:
+                            logger.debug("Matrix is not in canonical format for %s...", q_name)
+                            tmp_matrix.sum_duplicates()
+
+                        dij[q_name].flat[i] = tmp_matrix
+
+        if self.keep_rad_depth_cubes and self._rad_depth_cubes:
+            dij["rad_depth_cubes"] = self._rad_depth_cubes
+
+        # Call the finalizeDose method from the base class
+        return super()._finalize_dose(dij)
+    
+    
+    def _finalize_dose_gpu(self, dij: dict):
+        """
+        Finalize the dose influence matrix.
+
+        Pruning the matrix and concatenating the containers to a compressed
+        sparse matrix.
+
+        Parameters
+        ----------
+        dij : dict
+            The dose influence matrix.
+
+        Returns
+        -------
+        Dij
+            The finalized dose influence matrix.
+        """
+
+        # Loop over all scenarios and remove dose influence for voxels outside of segmentations
+        for i in range(self.mult_scen.scen_mask.size):
+            # Only if there is a scenario we will allocate
+            if self.mult_scen.scen_mask.flat[i]:
+                # Loop over all used quantities
+                for q_name in self._computed_quantities:
+                    if not self._calc_dose_direct:
+                        # tmp_matrix = cast(sparse.lil_matrix, dij[q_name].flat[i])
+                        # tmp_matrix = tmp_matrix.tocsr().T
+                        data_dict = dij[q_name][0][0][i]
+
+                        # Resize to the actual number of non-zero elements
+                        data_dict["data"]=self.cp.resize(data_dict["data"],(data_dict["nnz"],))
+                        data_dict["indices"]=self.cp.resize(data_dict["indices"],(data_dict["nnz"],))
+
+                        # Create the matrix, avoid copies
+                        tmp_matrix = cupyx.scipy.sparse.csc_matrix(
+                            (data_dict["data"], data_dict["indices"], data_dict["indptr"]),
+                            shape=(self.dose_grid.num_voxels, self._num_of_columns_dij),
+                            dtype=self.cp.float32,
+                            copy=False,
+                        )
+
+                        # Do we need this?
+                        tmp_matrix.eliminate_zeros()
+
+                        # make sure indices are sorted and matrix is canonical
+                        if not tmp_matrix.has_sorted_indices:
+                            logger.debug("Sorting indices for %s...", q_name)
+                            tmp_matrix.sort_indices()
+
+                        if not tmp_matrix.has_canonical_format:
+                            logger.debug("Matrix is not in canonical format for %s...", q_name)
+                            tmp_matrix.sum_duplicates()
+                        
+
+                        dij[q_name] = np.empty(self.mult_scen.scen_mask.shape, dtype=object)
+                        dij[q_name].flat[i] = tmp_matrix.get()
+
+
+
+
+        if self.keep_rad_depth_cubes and self._rad_depth_cubes:
+            dij["rad_depth_cubes"] = self._rad_depth_cubes
+
+        # Call the finalizeDose method from the base class
+        return super()._finalize_dose(dij)
+
+    
+
+    def calc_geo_dists(
+        self,
+        rot_coords_bev: Array,
+        source_point_bev: Array,
+        target_point_bev: Array,
+        sad: float,
+        rad_depth_mask: Array,
+        lateral_cutoff: float,
+    ):
+        """
+        Calculate geometric distances for dose calculation.
+
+        Parameters
+        ----------
+        rot_coords_bev : Array
+            Coordinates in beam's eye view (BEV) of the voxels where ray tracing results are
+            available.
+        source_point_bev : Array
+            Source point in voxel coordinates in BEV.
+        target_point_bev : Array
+            Target point in voxel coordinates in BEV.
+        sad : float
+            Source-to-axis distance.
+        rad_depth_mask : Array
+            Masks the voxels for which radiological depth calculations are available.
+        lateral_cutoff : float
+            Lateral cutoff specifying the neighborhood for dose calculations.
+
+        Returns
+        -------
+        ix : Array
+            Indices of voxels where dose influence is computed.
+        rad_distances_sq : Array
+            Squared radial distances to the central ray.
+        lat_dists : Array
+            Lateral distances to the central ray (in X & Z).
+        iso_lat_dists : Array
+            Lateral distances to the central ray projected onto the isocenter plane.
+        """
+        start=time.perf_counter()
+        xp = array_api_compat.array_namespace(
+            rot_coords_bev, source_point_bev, target_point_bev, rad_depth_mask
+        )
+
+        if hasattr(xp, "linalg"):
+            norm = xp.linalg.vector_norm
+            cross = xp.linalg.cross
+        else:
+
+            def norm(arr: Array) -> Array:
+                return xp.sqrt(xp.sum(arr**2, axis=-1))
+
+            def cross(x: Array, y: Array) -> Array:
+                return xp.stack(
+                    [
+                        x[..., 1] * y[..., 2] - x[..., 2] * y[..., 1],
+                        x[..., 2] * y[..., 0] - x[..., 0] * y[..., 2],
+                        x[..., 0] * y[..., 1] - x[..., 1] * y[..., 0],
+                    ],
+                    axis=-1,
+                )
+
+        # We later need a copy of the index, and we do it here to do some
+        # compatibility management with the array API standard
+        ix = xp.asarray(rad_depth_mask, copy=True)
+        rad_depth_ix = xp.nonzero(rad_depth_mask)[0]
+
+        # Make sure that the source-point is a 2D array
+        source_point_bev = xp.reshape(source_point_bev, (3,))
+        target_point_bev = xp.reshape(target_point_bev, (3,))
+
+        # Put [0 0 0] position in the source point for beamlet who passes through isocenter
+        a = -source_point_bev
+
+        # Normalize the vector
+        a /= norm(a)
+
+        # Put [0 0 0] position in the source point for a single beamlet
+        b = target_point_bev - source_point_bev
+
+        # Normalize the vector
+        b /= norm(b)
+
+        # Define rotation matrix
+        rot_coords_temp = xp.take(rot_coords_bev, rad_depth_ix, axis=0)
+        if not xp.all(a == b):
+            # Cross product
+            cross_ab = cross(a, b)
+
+            if self._eps_ijk is None:
+                self._eps_ijk = xp.asarray(
+                    [
+                        [[0, 0, 0], [0, 0, -1], [0, 1, 0]],
+                        [[0, 0, 1], [0, 0, 0], [-1, 0, 0]],
+                        [[0, -1, 0], [1, 0, 0], [0, 0, 0]],
+                    ],
+                    dtype=cross_ab.dtype,
+                )
+
+            ssc_matrix = xp.tensordot(cross_ab, self._eps_ijk, axes=1)
+
+            derived_rot_mat = (
+                xp.eye(3, dtype=a.dtype)
+                + ssc_matrix
+                + ssc_matrix @ ssc_matrix * (1 - xp.vecdot(a, b)) / (norm(cross_ab) ** 2)
+            )
+            # rot_coords_temp = np.dot(rot_coords_bev[rad_depth_ix, :], derived_rot_mat)
+            rot_coords_temp @= xp.astype(derived_rot_mat, rot_coords_temp.dtype)
+
+        # Put [0 0 0] position CT in center of the beamlet
+        xy_index = xp.asarray((0, 2), dtype=xp.int64)
+        lat_dists = xp.take(rot_coords_temp, xy_index, axis=1)
+        lat_dists += source_point_bev[xy_index]
+
+        # Check if radial distance exceeds lateral cutoff (projected to iso center)
+        rad_distances_sq = xp.sum(lat_dists**2, axis=1)
+        subset_mask = rad_distances_sq <= (lateral_cutoff / sad) ** 2 * rot_coords_temp[:, 1] ** 2
+
+        # Apply mask for return quantities
+        ix[rad_depth_mask] = subset_mask
+
+        # Return radial distances squared
+        rad_distances_sq = rad_distances_sq[subset_mask]
+
+        # for array API compatible indexing
+        sub_ix = xp.nonzero(subset_mask)[0]
+
+        # Lateral distances in X & Z
+        lat_dists = xp.take(lat_dists, sub_ix, axis=0)
+
+        if array_api_compat.size(sub_ix) > 0:
+            # Lateral distances projected onto isocenter
+            iso_lat_dists = lat_dists / rot_coords_temp[sub_ix, 1][:, None] * sad
+        else:
+            iso_lat_dists = xp.empty_like(lat_dists)
+        return ix, rad_distances_sq, lat_dists, iso_lat_dists
