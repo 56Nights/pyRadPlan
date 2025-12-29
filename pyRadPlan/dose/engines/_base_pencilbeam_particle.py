@@ -26,6 +26,7 @@ from ...core.xp_utils.compat import interp1d as array_interp
 logger = logging.getLogger(__name__)
 
 
+
 class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
     """
     Abstract interface for Particle Pencil-Beam dose calculation.
@@ -133,6 +134,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         dict
             The computed bixel.
         """
+        # print('on est pas du tout censé passer la')
         # Initialize Bixel Geometry
         bixel = self._init_bixel(curr_ray, k)
 
@@ -140,6 +142,100 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         self._calc_particle_bixel(bixel)
 
         return bixel
+    
+    def _compute_bixel_gpu(self, curr_ray: dict, curr_ray_gpu, k: int) -> dict:
+        # bixel = self._init_bixel(curr_ray, k) # 4.87 ms ± 30.9 μs
+        bixel = curr_ray["beamlets"][k].copy() # 35.8 ns ± 0.764 ns
+        bixel["beam_index"] = curr_ray["beam_index"] # 45.8 ns ± 0.884 ns
+        bixel["ray_index"] = curr_ray["ray_index"] # 46.1 ns ± 1.04 ns
+        bixel["bixel_index"] = k # 32.2 ns ± 1.08 ns
+        bixel["min_mu"] = 0 # 31 ns ± 1.66 ns
+        if "min_mu" in curr_ray:
+            bixel["min_mu"] = curr_ray["min_mu"][k]
+        bixel["max_mu"] = float("inf") # 83.9 ns ± 2.42 ns
+        if "max_mu" in curr_ray:
+            bixel["max_mu"] = curr_ray["max_mu"][k]
+        bixel["num_particles_per_mu"] = 1e6 # 30.5 ns ± 0.071 ns
+        if "num_particles_per_mu" in curr_ray:
+            bixel["num_particles_per_mu"] = curr_ray["num_particles_per_mu"][k]
+        energy = curr_ray["beamlets"][k]["energy"] # 47 ns ± 1.22 ns
+        energy_ix = self._machine.get_energy_index(energy, 4) # 10.7 μs ± 14.7 ns
+        if energy_ix.size > 1:
+            raise ValueError("Multiple energies found in base data for one bixel!")
+        energy_ix = np.int64(energy_ix) # 384 ns ± 0.728 ns
+        bixel["energy_ix"] = energy_ix # 32.1 ns ± 0.211 ns
+        tmp_machine = cast(ParticleAccelerator, self._machine) # 64.6 ns ± 0.37 ns
+        bixel["kernel"] = tmp_machine.get_kernel_by_index(energy_ix) # 416 ns ± 3.94 ns
+        bixel["range_shifter"] = curr_ray["beamlets"][k]["range_shifter"] # 67.6 ns ± 0.843 ns
+        bixel["SSD"] = curr_ray["SSD"] # 42.3 ns ± 0.585 ns
+        bixel["rad_depth_offset"] = curr_ray["rad_depth_offset"] # 53.6 ns ± 1.56 ns
+        bixel["sigma_ini_sq"] = curr_ray["sigma_ini"][k] ** 2 # 172 ns ± 0.621 ns
+        self._get_beam_modifiers(bixel) # 230 ns ± 1.03 ns
+###############################################################################
+        # self._get_bixel_indices_on_ray(bixel, curr_ray) # 3.32 ms ± 46.4 μs
+        kernel = cast(ParticlePencilBeamKernel, bixel["kernel"]) # 67 ns ± 1.82 ns
+        tmp_offset = kernel.offset - bixel["rad_depth_offset"] # 83.8 ns ± 0.679 ns
+        if self.dosimetric_lateral_cutoff == 1:
+            curr_ix_gpu = curr_ray_gpu["rad_depths"] <= kernel.depths[-1] + tmp_offset
+        elif 0 < self.dosimetric_lateral_cutoff < 1:
+            cutoff_info = kernel.lateral_cut_off # 24.3 ns ± 0.475 ns
+            
+            if cutoff_info.cut_off.size > 1:
+                curr_rad_depths_gpu = curr_ray_gpu["rad_depths"] # 27.8 ns ± 0.297 ns
+                cutoff_depths_gpu   = self.cp.asarray(cutoff_info.depths) # 65.4 μs ± 292 ns
+                cutoff_sq_gpu       = self.cp.asarray(cutoff_info.cut_off**2) # 71.3 μs ± 222 ns
+                radial_dist_sq_gpu  = curr_ray_gpu["radial_dist_sq"] # 27.7 ns ± 1.06 ns
+                kernel_last_depth   = self.cp.asarray(kernel.depths[-1]) # 45.9 μs ± 1.04 μs
+                tmp_offset_gpu      = self.cp.asarray(tmp_offset) # 38.3 μs ± 40.8 ns
+                interp_vals = self.cp.interp(
+                curr_rad_depths_gpu,
+                cutoff_depths_gpu + tmp_offset_gpu,
+                cutoff_sq_gpu,
+                left=self.cp.nan,
+                right=self.cp.nan,
+                ) # 344 μs ± 7.29 μs
+                curr_ix_gpu = (
+                (interp_vals >= radial_dist_sq_gpu)
+                & (curr_rad_depths_gpu <= kernel_last_depth + tmp_offset_gpu)
+                ) # 102 μs ± 6.86 μs
+            else:
+                curr_ix_gpu = (cutoff_info.cut_off[0] ** 2 >= curr_ray_gpu["radial_dist_sq"]) & (
+                    curr_ray_gpu["rad_depths"] <= kernel.depths[-1] + tmp_offset
+                )
+        else:
+            raise ValueError("dosimetric_lateral_cutoff must be a value > 0 and <= 1!")
+###############################################################################
+        # version GPU : 
+                   
+        idx_gpu = self.cp.where(curr_ix_gpu)[0] # 245 μs ± 4.27 μs
+        bixel_ix_gpu             = curr_ray_gpu["ix"].take(idx_gpu) # 46.5 μs ± 1.43 μs
+        bixel_radial_dist_sq_gpu = curr_ray_gpu["radial_dist_sq"].take(idx_gpu) # 45.2 μs ± 1.18 μs
+        bixel_rad_depth_gpu      = curr_ray_gpu["rad_depths"].take(idx_gpu) # 46.1 μs ± 1.3 μs
+        
+        if "lat_dists" in curr_ray_gpu:
+            bixel_lat_dists_gpu = curr_ray_gpu["lat_dists"].take(idx_gpu) # 50.1 μs ± 467 ns
+            bixel_gpu ={"sub_ix" : curr_ix_gpu,
+                        "ix" : bixel_ix_gpu,
+                        "radial_dist_sq": bixel_radial_dist_sq_gpu,
+                        "rad_depths": bixel_rad_depth_gpu,
+                        "lat_dists": bixel_lat_dists_gpu,
+                        }
+        else:
+            bixel_gpu ={"sub_ix" : curr_ix_gpu,
+                        "ix" : bixel_ix_gpu,
+                        "radial_dist_sq": bixel_radial_dist_sq_gpu,
+                        "rad_depths": bixel_rad_depth_gpu,
+                        }
+            
+        bixel["ix"] = self.cp.asnumpy(bixel_ix_gpu) # 110 μs ± 3.29 μs
+                
+###############################################################################        
+        # Compute Bixel
+        self._calc_particle_bixel_gpu(bixel,bixel_gpu) # 1.77 ms ± 68.3 μs
+        
+        return bixel
+
+    
 
     def _init_bixel(self, curr_ray, k):
         """
@@ -158,7 +254,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
             The initialized bixel.
         """
 
-        bixel = curr_ray["beamlets"][k]
+        bixel = curr_ray["beamlets"][k].copy()
         bixel["beam_index"] = curr_ray["beam_index"]
         bixel["ray_index"] = curr_ray["ray_index"]
         bixel["bixel_index"] = k
@@ -271,6 +367,59 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
 
         return kernel_interp
 
+    def _interpolate_kernels_in_depth_gpu(self, bixel, bixel_gpu):
+        kernel = cast(ParticlePencilBeamKernel, bixel["kernel"]) # 68 ns ± 2.07 ns
+        depths = kernel.depths # 23.9 ns ± 0.191 ns
+        # Add potential offset
+        depths = depths + kernel.offset - bixel["rad_depth_offset"] # 2.02 μs ± 14.7 ns
+
+        # Conversion factor from MeV cm^2/g per primary to Gy mm^2 per 1e6 primaries
+        conversion_factor = 1.6021766208e-02 # 14.5 ns ± 0.716 ns
+
+        # Find all values we need to interpolate
+        used_kernels = {} # 25.1 ns ± 0.747 ns
+        used_kernels["idd"] = conversion_factor * kernel.idd # 1 μs ± 11 ns per loop
+
+        # Lateral Kernel Model
+        if self.lateral_model == "single":
+            used_kernels["sigma"] = kernel.sigma
+        elif self.lateral_model == "singleXY":
+            used_kernels["sigma_x"] = kernel.sigma_x
+            used_kernels["sigma_y"] = kernel.sigma_y
+        elif self.lateral_model == "double":
+            used_kernels["sigma_1"] = kernel.sigma_1 # 39.1 ns ± 1.03 ns
+            used_kernels["sigma_2"] = kernel.sigma_2 # 38.8 ns ± 1.42 ns
+            used_kernels["weight"] = kernel.weight # 40.9 ns ± 1.1 ns
+        elif self.lateral_model == "multi":
+            used_kernels["weight_multi"] = kernel.weight_multi
+            used_kernels["sigma_multi"] = kernel.sigma_multi
+        else:
+            raise ValueError("Invalid Lateral Model")
+
+        # LET
+        if self.calc_let:
+            used_kernels["let"] = kernel.let
+
+        # bioDose
+        # TODO:
+        if self.calc_bio_dose:
+            used_kernels["alpha"] = kernel.alpha
+            used_kernels["beta"] = kernel.beta
+
+        # Interpolate all fields in X
+        # kernel_interp = array_interp(bixel["rad_depths"], depths, used_kernels) # 1.07 ms ± 7.38 μs
+                
+        # Version GPU
+        depths_gpu = self.cp.asarray(depths) # 70.1 μs ± 1.1 μs        
+        fields = list(used_kernels.keys()) #108 ns ± 4.09 ns
+        used_kernels_gpu = {field: self.cp.asarray(used_kernels[field]) for field in fields} # 274 μs ± 3.43 μs
+        interp_kernels = {} # 26 ns ± 0.518 ns
+        
+        interp_kernels = {field: self.cp.interp(bixel_gpu["rad_depths"], depths_gpu,used_kernels_gpu[field])for field in fields} # 467 μs ± 3.67 μs
+               
+        return interp_kernels
+
+
     def _get_ray_geometry_from_beam(self, ray: dict[str], beam_info: dict[str]):
         lateral_ray_cutoff = self._get_lateral_distance_from_dose_cutoff_on_ray(ray)
 
@@ -282,7 +431,7 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
             ray["sad"],
             beam_info["valid_coords_all"],
             lateral_ray_cutoff,
-        )
+        ) #45.9 ms ± 1.96 ms a 2,2,2
 
         # Subindex given the relevant indices from the geometric distance calculation
         ray["valid_coords"] = [beam_ix & ix for beam_ix in beam_info["valid_coords"]]
@@ -801,7 +950,6 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
                     "rad_depth_offset": 0,
                     "add_sigma_sq": 0,
                 }
-
                 self._calc_particle_bixel(bixel)
                 dose_r = bixel["physical_dose"]
 
@@ -866,8 +1014,8 @@ class ParticlePencilBeamEngineAbstract(PencilBeamEngineAbstract):
         scen_ray = super()._extract_single_scenario_ray(ray, scen_idx)
         # TODO: Add multscen support
         # Gets number of scenario
-        scen_num = 1  # self.mult_scen['scenNum'][scen_idx]
-        ct_scen = self.mult_scen.linear_mask[0][scen_num]
+        scen_num = 1  # 15.4 ns ± 0.431 ns
+        ct_scen = self.mult_scen.linear_mask[0][scen_num] # 1.61 μs ± 21.1 ns 
 
         if "vTissueIndex" in scen_ray:
             scen_ray["vTissueIndex"] = scen_ray["vTissueIndex"][ct_scen]

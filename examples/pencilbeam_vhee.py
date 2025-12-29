@@ -51,6 +51,8 @@ pln.prop_stf = {
     "bixel_width": 5.0,
     "gantry_angles": [0, 72, 144, 216, 288],
     "couch_angles": [0, 0, 0, 0, 0],
+    #"gantry_angles": [0],
+    #"couch_angles": [0],
 }
 
 # Setting the dose grid resolution
